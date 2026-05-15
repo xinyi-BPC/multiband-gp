@@ -1,5 +1,64 @@
 import numpy as np
 
+
+def _subset_processed_data(data, indices):
+    subset = data.copy()
+    for key in ("X", "t", "y", "yerr"):
+        subset[key] = np.asarray(data[key])[indices]
+    return subset
+
+
+def split_train_heldout_observations(
+        data,
+        heldout_fraction=0.2,
+        min_train_points=3,
+        min_heldout_points=1,
+        random_state=0,
+        strategy="random",
+):
+    """
+    Split one processed light curve into train and held-out observations.
+
+    Args:
+        data: Processed dictionary returned by process_one_obj_one_band.
+        heldout_fraction: Fraction of observations to hold out.
+        min_train_points: Minimum number of observations kept for fitting.
+        min_heldout_points: Minimum number of observations held out.
+        random_state: Seed used when strategy="random".
+        strategy: only support "random"
+    Returns:
+        (train_data, heldout_data), each with the same keys as data plus
+        train_indices/heldout_indices metadata.
+    """
+    n_obs = len(data["y"])
+    if n_obs < min_train_points + min_heldout_points:
+        raise ValueError(
+            "Not enough observations to make the requested split: "
+            f"{n_obs} available, {min_train_points + min_heldout_points} required."
+        )
+
+    n_heldout = int(np.ceil(n_obs * heldout_fraction))
+    n_heldout = max(min_heldout_points, n_heldout)
+    n_heldout = min(n_heldout, n_obs - min_train_points)
+
+    if strategy == "random":
+        rng = np.random.default_rng(random_state)
+        heldout_indices = np.sort(rng.choice(n_obs, size=n_heldout, replace=False))
+    else:
+        raise ValueError(f"Unsupported split strategy: {strategy}")
+
+    train_indices = np.setdiff1d(np.arange(n_obs), heldout_indices)
+    train_indices = train_indices[np.argsort(np.asarray(data["t"])[train_indices])]
+    heldout_indices = heldout_indices[np.argsort(np.asarray(data["t"])[heldout_indices])]
+
+    train_data = _subset_processed_data(data, train_indices)
+    heldout_data = _subset_processed_data(data, heldout_indices)
+    train_data["train_indices"] = train_indices
+    heldout_data["heldout_indices"] = heldout_indices
+
+    return train_data, heldout_data
+
+
 def process_one_obj_one_band(
         example,
         target_band='r',

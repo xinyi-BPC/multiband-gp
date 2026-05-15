@@ -1,15 +1,14 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
-def plot_gp_fit(gp, data, n_grid=300):
+def plot_gp_fit(gp, data, heldout_data=None, n_grid=300):
     """
     Plots the Gaussian Process fit along with the original data points.
     
     Args:
         gp: The fitted GaussianProcessRegressor model.
-        data: A dictionary containing 't', 'y', and 'yerr' arrays.
-        t_min: Minimum time for the plot.
-        t_max: Maximum time for the plot.
+        data: A dictionary containing training 't', 'y', and 'yerr' arrays.
+        heldout_data: Optional held-out observations to overlay.
         n_grid: Number of points in the grid for prediction.
     """
     t = data['t']
@@ -28,7 +27,18 @@ def plot_gp_fit(gp, data, n_grid=300):
     plt.figure(figsize=(10, 6))
     
     # Plot original data points with error bars
-    plt.errorbar(t.flatten(), y.flatten(), yerr=yerr.flatten(), fmt='o', label='Data', alpha=0.5)
+    plt.errorbar(t.flatten(), y.flatten(), yerr=yerr.flatten(), fmt='o', label='Train', alpha=0.5)
+
+    if heldout_data is not None:
+        plt.errorbar(
+            np.asarray(heldout_data['t']).flatten(),
+            np.asarray(heldout_data['y']).flatten(),
+            yerr=np.asarray(heldout_data['yerr']).flatten(),
+            fmt='s',
+            label='Held-out',
+            color='black',
+            alpha=0.8,
+        )
     
     # Plot GP mean prediction
     plt.plot(t_grid.flatten(), y_pred.flatten(), label='GP Mean', color='red')
