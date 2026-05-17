@@ -58,9 +58,96 @@ def split_train_heldout_observations(
 
     return train_data, heldout_data
 
+def _extract_valid_band_observations(example, target_band):
+    lc = example["lightcurve"]
+    time = np.array(lc['time'])
+    flux = np.array(lc['flux'])
+    flux_err = np.array(lc["flux_err"])
+    band = np.array(lc["band"])
+
+    valid = (band == target_band) * (time > 0) * np.isfinite(time) * np.isfinite(flux) * np.isfinite(flux_err)
+
+    t = time[valid]
+    y = flux[valid]
+    yerr = flux_err[valid]
+
+    order = np.argsort(t)
+
+    return t[order], y[order], yerr[order]
+
+
+def _is_usable_one_band_example(example, target_band, min_points):
+    t, _, _ = _extract_valid_band_observations(example, target_band)
+
+    return len(t) >= min_points and np.std(t) > 0
+
+
+def find_global_percentile_flux_peak(examples, target_band, percentile=99, min_points=5):
+    """
+    Find a global percentile-based flux scale from an iterable of examples.
+
+    Args:
+        examples: Iterable of object examples.
+        target_band: The band to filter the data (e.g., 'r').
+        percentile: Percentile of absolute flux values to use as the scale.
+        min_points: Minimum valid points required for an object to contribute.
+    Returns:
+        percentile_based_peak_flux: The flux value at the specified percentile.
+    """
+    flux_values = []
+    for example in examples:
+        t, y, _ = _extract_valid_band_observations(example, target_band)
+        if len(t) >= min_points and np.std(t) > 0:
+            flux_values.append(np.abs(y))
+
+    if len(flux_values) == 0:
+        return None
+
+    flux_values = np.concatenate(flux_values)
+    percentile_based_peak_flux = np.percentile(flux_values, percentile)
+    if percentile_based_peak_flux <= 0:
+        raise ValueError("Computed flux scale for this band is zero or negative.")
+
+    return percentile_based_peak_flux
+
+
+def select_examples_and_global_flux_scale(
+        examples,
+        target_band='r',
+        n_objects=300,
+        max_examples_to_scan=3000,
+        percentile=99,
+        min_points=8,
+):
+    """
+    Select usable examples and compute a global flux scale from the same objects.
+
+    This is useful for streaming datasets: the selected examples are exactly the
+    examples that should later be used by the training/evaluation loop.
+    """
+    selected_examples = []
+    scanned_examples = 0
+
+    for stream_idx, example in enumerate(examples):
+        if len(selected_examples) >= n_objects or stream_idx >= max_examples_to_scan:
+            break
+
+        scanned_examples = stream_idx + 1
+        if _is_usable_one_band_example(example, target_band, min_points):
+            selected_examples.append(example)
+
+    flux_scale = find_global_percentile_flux_peak(
+        selected_examples,
+        target_band=target_band,
+        percentile=percentile,
+        min_points=min_points,
+    )
+
+    return selected_examples, flux_scale, scanned_examples
 
 def process_one_obj_one_band(
         example,
+        flux_scale=None,
         target_band='r',
         align_peak=True,
         normalize_flux=True,
@@ -69,7 +156,8 @@ def process_one_obj_one_band(
     """
     Process one object in one band.
     Args:
-        example: a dictionary containing the light curve data for one object.
+        example: a dictionary containing the light curve data for <one object>.
+        flux_scale: a global flux scale to use for normalization, or None to use the peak flux of this example.
         target_band: the band to process (e.g., 'r').
         align_peak: whether to align the peak of the light curve to time zero.
         normalize_flux: whether to normalize the flux values by the peak flux.
@@ -77,29 +165,11 @@ def process_one_obj_one_band(
     Returns:
         A dictionary with processed time and flux arrays, or None if the example is discarded.
     """
-    # Extract time and flux
-    lc = example["lightcurve"]
-    time = np.array(lc['time'])
-    flux = np.array(lc['flux'])
-    flux_err = np.array(lc["flux_err"])
-    band = np.array(lc["band"])
-    
-    # Extract entries from the target band and remove invalid entries
-    valid = (band == target_band) * (time > 0) * np.isfinite(time) * np.isfinite(flux) * np.isfinite(flux_err)
-
-    t = time[valid]
-    y = flux[valid]
-    yerr = flux_err[valid]
+    t, y, yerr = _extract_valid_band_observations(example, target_band)
 
     # Check if there are enough points
     if len(t) < min_points:
         return None
-    
-    # sort by time
-    order = np.argsort(t)
-    t = t[order]
-    y = y[order]
-    yerr = yerr[order]
 
     # Align peak if required
     if align_peak:
@@ -115,17 +185,21 @@ def process_one_obj_one_band(
 
     # Normalize flux if required
     if normalize_flux:
-        peak_flux = np.max(np.abs(y))   # Use absolute value to handle negative peaks
-        if peak_flux <= 0:
-            return None
-        
-        y = y / peak_flux
-        yerr = yerr / peak_flux
+        if flux_scale is None:
+            peak_flux = np.max(np.abs(y))
+            if peak_flux <= 0:
+                return None
+            flux_scale = peak_flux
+        else:
+            peak_flux = flux_scale
+        y = y / flux_scale
+        yerr = yerr / flux_scale
     else:
         # If not normalizing, we can still filter out examples with non-positive peak flux
         if np.max(np.abs(y)) <= 0:
             return None
         peak_flux = 1.0
+        flux_scale = 1.0
     
     # sklearn expects X shape = (n_samples, n_features)
     X = t.reshape(-1, 1)
@@ -140,4 +214,5 @@ def process_one_obj_one_band(
         'obj_id': example['object_id'],
         't_peak': t[np.argmax(y)],
         'peak_flux': peak_flux,
+        'flux_scale': flux_scale,
     }
