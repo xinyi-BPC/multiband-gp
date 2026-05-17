@@ -55,3 +55,86 @@ def plot_gp_fit(gp, data, heldout_data=None, n_grid=300):
     plt.legend()
     plt.grid()
     plt.show()
+
+
+def plot_largest_standardized_residual_cases(object_results, cases, max_plots=10, n_grid=300):
+    """
+    Plot objects for the largest standardized residual cases.
+
+    object_results must contain "gp", "train_data", and "heldout_data" entries
+    for each object, as added in the notebook after evaluate_heldout_metrics.
+    """
+    plotted = set()
+    n_plotted = 0
+
+    for case in cases:
+        result_idx = case["result_idx"]
+        point_idx = case["point_idx"]
+        if (result_idx, point_idx) in plotted:
+            continue
+
+        result = object_results[result_idx]
+        gp = result["gp"]
+        train_data = result["train_data"]
+        heldout_data = result["heldout_data"]
+
+        t_all = np.concatenate([
+            np.asarray(train_data["t"]),
+            np.asarray(heldout_data["t"]),
+        ])
+        t_grid = np.linspace(t_all.min(), t_all.max(), n_grid).reshape(-1, 1)
+        y_pred, y_std = gp.predict(t_grid, return_std=True)
+
+        plt.figure(figsize=(10, 6))
+        plt.errorbar(
+            np.asarray(train_data["t"]).flatten(),
+            np.asarray(train_data["y"]).flatten(),
+            yerr=np.asarray(train_data["yerr"]).flatten(),
+            fmt="o",
+            label="Train",
+            alpha=0.5,
+        )
+        plt.errorbar(
+            np.asarray(heldout_data["t"]).flatten(),
+            np.asarray(heldout_data["y"]).flatten(),
+            yerr=np.asarray(heldout_data["yerr"]).flatten(),
+            fmt="s",
+            label="Held-out",
+            color="black",
+            alpha=0.65,
+        )
+        plt.scatter(
+            [case["time"]],
+            [case["y"]],
+            s=140,
+            facecolors="none",
+            edgecolors="orange",
+            linewidths=2.5,
+            label="Highlighted |z| case",
+            zorder=5,
+        )
+        plt.plot(t_grid.flatten(), y_pred.flatten(), label="GP Mean", color="red")
+        plt.fill_between(
+            t_grid.flatten(),
+            (y_pred - y_std).flatten(),
+            (y_pred + y_std).flatten(),
+            color="red",
+            alpha=0.25,
+            label="GP Std Dev",
+        )
+        plt.axvline(case["train_time_min"], color="gray", linestyle="--", alpha=0.4)
+        plt.axvline(case["train_time_max"], color="gray", linestyle="--", alpha=0.4)
+        plt.title(
+            f"{case['object_id']} | band {case['band']} | "
+            f"z={case['z']:.2f} | edge={case['outside_train_range']} | peak={case['near_peak']}"
+        )
+        plt.xlabel("Time (standardized, peak-aligned)")
+        plt.ylabel("Normalized Flux")
+        plt.legend()
+        plt.grid()
+        plt.show()
+
+        plotted.add((result_idx, point_idx))
+        n_plotted += 1
+        if n_plotted >= max_plots:
+            break

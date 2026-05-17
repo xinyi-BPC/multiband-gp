@@ -177,9 +177,11 @@ def cover_factor(gp, data, sigma_multiplier=1.0):
 def evaluate_heldout_metrics(
         gp,
         heldout_data,
+        train_data=None,
         coverage_sigmas=(1.0, 2.0, 3.0),
         include_yerr=True,
         extra_noise=0,
+        peak_window=0.25,
 ):
     """
     Evaluate NLPD, RMSE, and coverage for one object's held-out observations.
@@ -204,9 +206,41 @@ def evaluate_heldout_metrics(
         coverage_counts[key] = int(np.sum(covered))
 
     n_heldout = len(y_true)
+    t_test = np.asarray(heldout_data["t"])
+    yerr_test = np.asarray(heldout_data["yerr"])
+    band = heldout_data.get("band", None)
+    obj_id = heldout_data.get("obj_id", None)
+
+    if train_data is not None:
+        train_t = np.asarray(train_data["t"])
+        train_time_min = float(np.min(train_t))
+        train_time_max = float(np.max(train_t))
+        # marks held-out points that are outside the training time range
+        outside_train_range = (t_test < train_time_min) | (t_test > train_time_max)  
+        # This measures how far outside the training range each held-out point is.
+        distance_to_train_range = np.maximum.reduce([
+            train_time_min - t_test,
+            t_test - train_time_max,
+            np.zeros_like(t_test),
+        ])
+        # This counts the number of training points. Useful for spotting sparse-object failures.
+        n_train = len(train_t)
+    else:
+        train_time_min = np.nan
+        train_time_max = np.nan
+        outside_train_range = np.full(n_heldout, False)
+        distance_to_train_range = np.full(n_heldout, np.nan)
+        n_train = None
+
+    # This marks whether each held-out point is close to the object’s peak time
+    peak_time = heldout_data.get("t_peak", np.nan)
+    near_peak = np.abs(t_test - peak_time) <= peak_window
 
     return {
         "n_heldout": n_heldout,
+        "n_train": n_train,
+        "train_time_min": train_time_min,
+        "train_time_max": train_time_max,
         "mean_nlpd": float(np.mean(per_point_nlpd)),
         "total_nlpd": float(np.sum(per_point_nlpd)),
         "rmse": float(np.sqrt(np.mean(squared_errors))),
@@ -218,6 +252,14 @@ def evaluate_heldout_metrics(
         "y_true": y_true,
         "y_pred": mean,
         "y_std": std,
+        "yerr": yerr_test,
+        "time": t_test,
+        "X_test": np.asarray(heldout_data["X"]).reshape(n_heldout, -1),
+        "object_id": np.repeat(obj_id, n_heldout),
+        "band": np.repeat(band, n_heldout),
+        "outside_train_range": outside_train_range,
+        "distance_to_train_range": distance_to_train_range,
+        "near_peak": near_peak,
         "predictive_variance": variance,
     }
 
@@ -298,3 +340,69 @@ def standardized_residual_statistics(object_results):
         "p95_abs_z": float(np.percentile(abs_z, 95)),
         "p99_abs_z": float(np.percentile(abs_z, 99)),
     }
+
+
+def largest_standardized_residual_cases(object_results, top_n=20):
+    """
+    Return the held-out points with the largest absolute standardized residuals.
+    """
+    if len(object_results) == 0:
+        raise ValueError("object_results must contain at least one result.")
+
+    rows = []
+    for result_idx, result in enumerate(object_results):
+        y_true = np.asarray(result["y_true"])
+        y_pred = np.asarray(result["y_pred"])
+        y_std = np.maximum(np.asarray(result["y_std"]), 1e-12)
+        z = (y_true - y_pred) / y_std
+        abs_z = np.abs(z)
+
+        for point_idx in range(len(y_true)):
+            rows.append({
+                "result_idx": result_idx,
+                "point_idx": point_idx,
+                "object_id": result["object_id"][point_idx],
+                "band": result["band"][point_idx],
+                "time": result["time"][point_idx],
+                "X_test": result["X_test"][point_idx],
+                "y": y_true[point_idx],
+                "mean": y_pred[point_idx],
+                "std": y_std[point_idx],
+                "z": z[point_idx],
+                "abs_z": abs_z[point_idx],
+                "yerr": result["yerr"][point_idx],
+                "outside_train_range": result["outside_train_range"][point_idx],
+                "distance_to_train_range": result["distance_to_train_range"][point_idx],
+                "near_peak": result["near_peak"][point_idx],
+                "n_train": result["n_train"],
+                "n_heldout": result["n_heldout"],
+                "train_time_min": result["train_time_min"],
+                "train_time_max": result["train_time_max"],
+            })
+
+    # Sort by absolute standardized residual and return the top cases
+    rows = sorted(rows, key=lambda row: row["abs_z"], reverse=True)
+    return rows[:top_n]
+
+
+def print_largest_standardized_residual_cases(object_results, top_n=20):
+    """
+    Print the largest standardized residual cases in a notebook-friendly format.
+    """
+    rows = largest_standardized_residual_cases(object_results, top_n=top_n)
+    for row in rows:
+        print(
+            "object_id:", row["object_id"],
+            "band:", row["band"],
+            "time:", row["time"],
+            "X_test:", row["X_test"],
+            "y:", row["y"],
+            "mean:", row["mean"],
+            "std:", row["std"],
+            "z:", row["z"],
+            "yerr:", row["yerr"],
+            "outside_train_range:", row["outside_train_range"],
+            "near_peak:", row["near_peak"],
+            "n_train:", row["n_train"],
+        )
+    return rows

@@ -181,6 +181,8 @@ def process_one_obj_one_band(
     if t_scale <= 0:
         return None
 
+    # TODO: data leakage risk here since t_scale is computed using all data, including held-out points.
+    #  the scaling can change the pairwise distances. That affects the effective length scale.
     t = t / t_scale
 
     # Normalize flux if required
