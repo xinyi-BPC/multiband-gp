@@ -8,6 +8,35 @@ def _subset_processed_data(data, indices):
     return subset
 
 
+def _split_indices(
+        n_obs,
+        heldout_fraction=0.2,
+        min_train_points=3,
+        min_heldout_points=1,
+        random_state=0,
+        strategy="random",
+):
+    if n_obs < min_train_points + min_heldout_points:
+        raise ValueError(
+            "Not enough observations to make the requested split: "
+            f"{n_obs} available, {min_train_points + min_heldout_points} required."
+        )
+
+    n_heldout = int(np.ceil(n_obs * heldout_fraction))
+    n_heldout = max(min_heldout_points, n_heldout)
+    n_heldout = min(n_heldout, n_obs - min_train_points)
+
+    if strategy == "random":
+        rng = np.random.default_rng(random_state)
+        heldout_indices = np.sort(rng.choice(n_obs, size=n_heldout, replace=False))
+    else:
+        raise ValueError(f"Unsupported split strategy: {strategy}")
+
+    train_indices = np.setdiff1d(np.arange(n_obs), heldout_indices)
+
+    return train_indices, heldout_indices
+
+
 def split_train_heldout_observations(
         data,
         heldout_fraction=0.2,
@@ -31,23 +60,14 @@ def split_train_heldout_observations(
         train_indices/heldout_indices metadata.
     """
     n_obs = len(data["y"])
-    if n_obs < min_train_points + min_heldout_points:
-        raise ValueError(
-            "Not enough observations to make the requested split: "
-            f"{n_obs} available, {min_train_points + min_heldout_points} required."
-        )
-
-    n_heldout = int(np.ceil(n_obs * heldout_fraction))
-    n_heldout = max(min_heldout_points, n_heldout)
-    n_heldout = min(n_heldout, n_obs - min_train_points)
-
-    if strategy == "random":
-        rng = np.random.default_rng(random_state)
-        heldout_indices = np.sort(rng.choice(n_obs, size=n_heldout, replace=False))
-    else:
-        raise ValueError(f"Unsupported split strategy: {strategy}")
-
-    train_indices = np.setdiff1d(np.arange(n_obs), heldout_indices)
+    train_indices, heldout_indices = _split_indices(
+        n_obs,
+        heldout_fraction=heldout_fraction,
+        min_train_points=min_train_points,
+        min_heldout_points=min_heldout_points,
+        random_state=random_state,
+        strategy=strategy,
+    )
     train_indices = train_indices[np.argsort(np.asarray(data["t"])[train_indices])]
     heldout_indices = heldout_indices[np.argsort(np.asarray(data["t"])[heldout_indices])]
 
@@ -74,6 +94,30 @@ def _extract_valid_band_observations(example, target_band):
     order = np.argsort(t)
 
     return t[order], y[order], yerr[order]
+
+
+def _find_alignment_peak_time(example, target_band, t, y, peak_alignment):
+    if peak_alignment == "target_peak":
+        return t[np.argmax(y)]
+    if peak_alignment == "target_abs_peak":
+        return t[np.argmax(np.abs(y))]
+    if peak_alignment in ("global_peak", "global_abs_peak"):
+        lc = example["lightcurve"]
+        time = np.array(lc["time"])
+        flux = np.array(lc["flux"])
+        flux_err = np.array(lc["flux_err"])
+
+        valid = (time > 0) * np.isfinite(time) * np.isfinite(flux) * np.isfinite(flux_err)
+        if not np.any(valid):
+            return None
+
+        global_time = time[valid]
+        global_flux = flux[valid]
+        if peak_alignment == "global_peak":
+            return global_time[np.argmax(global_flux)]
+        return global_time[np.argmax(np.abs(global_flux))]
+
+    raise ValueError(f"Unsupported peak_alignment: {peak_alignment}")
 
 
 def _is_usable_one_band_example(example, target_band, min_points):
@@ -150,6 +194,7 @@ def process_one_obj_one_band(
         flux_scale=None,
         target_band='r',
         align_peak=True,
+        peak_alignment="target_peak",
         normalize_flux=True,
         min_points=5,
 ):
@@ -160,6 +205,7 @@ def process_one_obj_one_band(
         flux_scale: a global flux scale to use for normalization, or None to use the peak flux of this example.
         target_band: the band to process (e.g., 'r').
         align_peak: whether to align the peak of the light curve to time zero.
+        peak_alignment: "target_peak", "target_abs_peak", "global_peak", or "global_abs_peak".
         normalize_flux: whether to normalize the flux values by the peak flux.
         min_points: minimum number of data points required to keep the example.
     Returns:
@@ -173,16 +219,24 @@ def process_one_obj_one_band(
 
     # Align peak if required
     if align_peak:
-        peak_index = np.argmax(y)
-        t = t - t[peak_index]
+        alignment_peak_time = _find_alignment_peak_time(
+            example,
+            target_band,
+            t,
+            y,
+            peak_alignment,
+        )
+        if alignment_peak_time is None:
+            return None
+        t = t - alignment_peak_time
+    else:
+        alignment_peak_time = np.nan
         
     # Normalize time by its standard deviation to help with GP fitting
     t_scale = np.std(t)
     if t_scale <= 0:
         return None
 
-    # TODO: data leakage risk here since t_scale is computed using all data, including held-out points.
-    #  the scaling can change the pairwise distances. That affects the effective length scale.
     t = t / t_scale
 
     # Normalize flux if required
@@ -214,7 +268,157 @@ def process_one_obj_one_band(
         'band': target_band,
         'obj_type': example['obj_type'],
         'obj_id': example['object_id'],
-        't_peak': t[np.argmax(y)],
+        't_peak': 0.0 if align_peak else t[np.argmax(y)],
+        'target_peak_time': t[np.argmax(y)],
+        'alignment_peak_time': alignment_peak_time,
+        'peak_alignment': peak_alignment,
         'peak_flux': peak_flux,
         'flux_scale': flux_scale,
     }
+
+
+def _make_processed_subset(
+        example,
+        target_band,
+        t_raw,
+        y_raw,
+        yerr_raw,
+        alignment_peak_time,
+        t_scale,
+        flux_scale,
+        peak_flux,
+        peak_alignment,
+        train_indices=None,
+        heldout_indices=None,
+):
+    t = (t_raw - alignment_peak_time) / t_scale
+    y = y_raw / flux_scale
+    yerr = yerr_raw / flux_scale
+    X = t.reshape(-1, 1)
+
+    data = {
+        'X': X,
+        't': t,
+        'y': y,
+        'yerr': yerr,
+        'band': target_band,
+        'obj_type': example['obj_type'],
+        'obj_id': example['object_id'],
+        't_peak': 0.0,
+        'target_peak_time': (t_raw[np.argmax(y_raw)] - alignment_peak_time) / t_scale,
+        'alignment_peak_time': alignment_peak_time,
+        'peak_alignment': peak_alignment,
+        'peak_flux': peak_flux,
+        'flux_scale': flux_scale,
+        't_scale': t_scale,
+    }
+    if train_indices is not None:
+        data["train_indices"] = train_indices
+    if heldout_indices is not None:
+        data["heldout_indices"] = heldout_indices
+
+    return data
+
+
+def process_one_obj_one_band_train_heldout(
+        example,
+        flux_scale=None,
+        target_band='r',
+        align_peak=True,
+        peak_alignment="target_peak",
+        normalize_flux=True,
+        min_points=8,
+        heldout_fraction=0.2,
+        min_train_points=5,
+        min_heldout_points=1,
+        random_state=0,
+        strategy="random",
+):
+    """
+    Split raw observations first, then fit preprocessing from training data only.
+
+    This avoids leakage from held-out points into peak alignment and time scaling.
+    """
+    t_raw, y_raw, yerr_raw = _extract_valid_band_observations(example, target_band)
+    if len(t_raw) < min_points:
+        return None, None
+
+    train_indices, heldout_indices = _split_indices(
+        len(t_raw),
+        heldout_fraction=heldout_fraction,
+        min_train_points=min_train_points,
+        min_heldout_points=min_heldout_points,
+        random_state=random_state,
+        strategy=strategy,
+    )
+    train_indices = train_indices[np.argsort(t_raw[train_indices])]
+    heldout_indices = heldout_indices[np.argsort(t_raw[heldout_indices])]
+
+    train_t_raw = t_raw[train_indices]
+    train_y_raw = y_raw[train_indices]
+    train_yerr_raw = yerr_raw[train_indices]
+    heldout_t_raw = t_raw[heldout_indices]
+    heldout_y_raw = y_raw[heldout_indices]
+    heldout_yerr_raw = yerr_raw[heldout_indices]
+
+    if align_peak:
+        # Use only target-band training observations to avoid leakage.
+        alignment_peak_time = _find_alignment_peak_time(
+            example,
+            target_band,
+            train_t_raw,
+            train_y_raw,
+            peak_alignment if not peak_alignment.startswith("global") else "target_abs_peak",
+        )
+        if alignment_peak_time is None:
+            return None, None
+    else:
+        alignment_peak_time = 0.0
+
+    train_t_centered = train_t_raw - alignment_peak_time
+    t_scale = np.std(train_t_centered)
+    if t_scale <= 0:
+        return None, None
+
+    if normalize_flux:
+        if flux_scale is None:
+            peak_flux = np.max(np.abs(train_y_raw))
+            if peak_flux <= 0:
+                return None, None
+            flux_scale = peak_flux
+        else:
+            peak_flux = flux_scale
+    else:
+        if np.max(np.abs(train_y_raw)) <= 0:
+            return None, None
+        peak_flux = 1.0
+        flux_scale = 1.0
+
+    train_data = _make_processed_subset(
+        example,
+        target_band,
+        train_t_raw,
+        train_y_raw,
+        train_yerr_raw,
+        alignment_peak_time,
+        t_scale,
+        flux_scale,
+        peak_flux,
+        peak_alignment,
+        train_indices=train_indices,
+    )
+    heldout_data = _make_processed_subset(
+        example,
+        target_band,
+        heldout_t_raw,
+        heldout_y_raw,
+        heldout_yerr_raw,
+        alignment_peak_time,
+        t_scale,
+        flux_scale,
+        peak_flux,
+        peak_alignment,
+        heldout_indices=heldout_indices,
+    )
+
+    return train_data, heldout_data

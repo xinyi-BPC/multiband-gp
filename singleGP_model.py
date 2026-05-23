@@ -6,9 +6,12 @@ def fit_basic_gp(
         data,
         kernel_type="matern",
         length_scale=0.3,
-        length_scale_bounds=(0.05, 5.0),
+        length_scale_bounds=(0.1, 5.0),
         constant_value=1.0,
         constant_value_bounds=(1e-2, 1e2),
+        yerr_scale=1.0,
+        noise_floor=0.0,
+        jitter=1e-8,
         n_restarts_optimizer=5,
         random_state=0,
 ):
@@ -37,8 +40,8 @@ def fit_basic_gp(
     
     gp = GaussianProcessRegressor(
         kernel=kernel,
-        alpha=data["yerr"]**2 + 0.03**2,    # Use the squared errors as the noise level
-        normalize_y=True,
+        alpha=(yerr_scale * data["yerr"])**2 + noise_floor**2 + jitter,
+        normalize_y=False,
         n_restarts_optimizer=n_restarts_optimizer,
         random_state=random_state,
     )
@@ -48,7 +51,14 @@ def fit_basic_gp(
     return gp
 
 
-def predict_observation_distribution(gp, data, include_yerr=True, extra_noise=0):
+def predict_observation_distribution(
+        gp,
+        data,
+        include_yerr=True,
+        yerr_scale=1.0,
+        noise_floor=0.0,
+        extra_noise=None,
+):
     """
     Predict the distribution for observed flux values at data['X'].
 
@@ -57,11 +67,13 @@ def predict_observation_distribution(gp, data, include_yerr=True, extra_noise=0)
     """
     mean, latent_std = gp.predict(data["X"], return_std=True)
     variance = latent_std ** 2
+    if extra_noise is not None:
+        noise_floor = extra_noise
 
     if include_yerr:
-        variance = variance + np.asarray(data["yerr"]) ** 2
-    if extra_noise is not None and extra_noise > 0:
-        variance = variance + extra_noise ** 2
+        variance = variance + (yerr_scale * np.asarray(data["yerr"])) ** 2
+    if noise_floor is not None and noise_floor > 0:
+        variance = variance + noise_floor ** 2
 
     return mean, np.sqrt(variance), variance
 
@@ -92,7 +104,14 @@ def evaluate_heldout_rmse(gp, heldout_data):
         "y_pred": mean,
     }
 
-def evaluate_heldout_nlpd(gp, heldout_data, include_yerr=True, extra_noise=0):
+def evaluate_heldout_nlpd(
+        gp,
+        heldout_data,
+        include_yerr=True,
+        yerr_scale=1.0,
+        noise_floor=0.0,
+        extra_noise=None,
+):
     """
     Compare held-out observations with the GP predictive distribution using NLPD.
     """
@@ -100,6 +119,8 @@ def evaluate_heldout_nlpd(gp, heldout_data, include_yerr=True, extra_noise=0):
         gp,
         heldout_data,
         include_yerr=include_yerr,
+        yerr_scale=yerr_scale,
+        noise_floor=noise_floor,
         extra_noise=extra_noise,
     )
     per_point_nlpd = negative_log_predictive_density(
@@ -180,7 +201,9 @@ def evaluate_heldout_metrics(
         train_data=None,
         coverage_sigmas=(1.0, 2.0, 3.0),
         include_yerr=True,
-        extra_noise=0,
+        yerr_scale=1.0,
+        noise_floor=0.0,
+        extra_noise=None,
         peak_window=0.25,
 ):
     """
@@ -190,6 +213,8 @@ def evaluate_heldout_metrics(
         gp,
         heldout_data,
         include_yerr=include_yerr,
+        yerr_scale=yerr_scale,
+        noise_floor=noise_floor,
         extra_noise=extra_noise,
     )
     y_true = np.asarray(heldout_data["y"])
@@ -232,8 +257,14 @@ def evaluate_heldout_metrics(
         distance_to_train_range = np.full(n_heldout, np.nan)
         n_train = None
 
-    # This marks whether each held-out point is close to the object’s peak time
-    peak_time = heldout_data.get("t_peak", np.nan)
+    # This marks whether each held-out point is close to the object’s global peak time
+    if train_data is not None:
+        all_t = np.concatenate([train_data["t"], heldout_data["t"]])
+        all_y = np.concatenate([train_data["y"], heldout_data["y"]])
+
+        peak_time = all_t[np.argmax(np.abs(all_y))]
+    else:
+        peak_time = t_test[np.argmax(np.abs(y_true))]
     near_peak = np.abs(t_test - peak_time) <= peak_window
 
     return {
@@ -339,6 +370,30 @@ def standardized_residual_statistics(object_results):
         "max_abs_z": float(np.max(abs_z)),
         "p95_abs_z": float(np.percentile(abs_z, 95)),
         "p99_abs_z": float(np.percentile(abs_z, 99)),
+    }
+
+
+def yerr_statistics(object_results):
+    """
+    Summarize held-out measurement errors and their relationship to residuals.
+    """
+    if len(object_results) == 0:
+        raise ValueError("object_results must contain at least one result.")
+
+    yerr = np.concatenate([np.asarray(result["yerr"]) for result in object_results])
+    y_true, y_pred, y_std = collect_heldout_predictions(object_results)
+    residual = y_true - y_pred
+    z = residual / np.maximum(y_std, 1e-12)
+    abs_z = np.abs(z)
+
+    return {
+        "min_yerr": float(np.min(yerr)),
+        "median_yerr": float(np.median(yerr)),
+        "mean_yerr": float(np.mean(yerr)),
+        "p95_yerr": float(np.percentile(yerr, 95)),
+        "max_yerr": float(np.max(yerr)),
+        "median_yerr_top_1pct_abs_z": float(np.median(yerr[abs_z >= np.percentile(abs_z, 99)])),
+        "median_yerr_top_5pct_abs_z": float(np.median(yerr[abs_z >= np.percentile(abs_z, 95)])),
     }
 
 

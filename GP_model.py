@@ -11,4 +11,5 @@ from singleGP_model import (
     predict_observation_distribution,
     standardized_residual_statistics,
     summarize_object_metric_results,
+    yerr_statistics,
 )

@@ -45,15 +45,16 @@ def plot_gp_fit(gp, data, heldout_data=None, n_grid=300):
     
     # Fill between mean ± std
     plt.fill_between(t_grid.flatten(), (y_pred - y_std).flatten(), (y_pred + y_std).flatten(), 
-                     color='red', alpha=0.3, label='GP Std Dev')
+                     color='red', alpha=0.3, label='GP Latent Std Dev')
     
     plt.title(
         f"{data['obj_type']} | band {data['band']} | object {data['obj_id']}"
     )
     plt.xlabel('Time (days)')
     plt.ylabel('Normalized Flux')
-    plt.legend()
+    plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
     plt.grid()
+    plt.tight_layout()
     plt.show()
 
 
@@ -120,7 +121,7 @@ def plot_largest_standardized_residual_cases(object_results, cases, max_plots=10
             (y_pred + y_std).flatten(),
             color="red",
             alpha=0.25,
-            label="GP Std Dev",
+            label="GP Latent Std Dev",
         )
         plt.axvline(case["train_time_min"], color="gray", linestyle="--", alpha=0.4)
         plt.axvline(case["train_time_max"], color="gray", linestyle="--", alpha=0.4)
@@ -130,8 +131,9 @@ def plot_largest_standardized_residual_cases(object_results, cases, max_plots=10
         )
         plt.xlabel("Time (standardized, peak-aligned)")
         plt.ylabel("Normalized Flux")
-        plt.legend()
+        plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
         plt.grid()
+        plt.tight_layout()
         plt.show()
 
         plotted.add((result_idx, point_idx))
