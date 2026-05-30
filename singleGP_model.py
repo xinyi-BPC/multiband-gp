@@ -58,6 +58,7 @@ def predict_observation_distribution(
         yerr_scale=1.0,
         noise_floor=0.0,
         extra_noise=None,
+        return_raw_flux=False,
 ):
     """
     Predict the distribution for observed flux values at data['X'].
@@ -74,6 +75,12 @@ def predict_observation_distribution(
         variance = variance + (yerr_scale * np.asarray(data["yerr"])) ** 2
     if noise_floor is not None and noise_floor > 0:
         variance = variance + noise_floor ** 2
+
+    if return_raw_flux:
+        flux_scale = data["flux_scale"]
+        background_flux = data.get("background_flux", 0.0)
+        mean = mean * flux_scale + background_flux
+        variance = variance * flux_scale ** 2
 
     return mean, np.sqrt(variance), variance
 

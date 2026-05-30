@@ -15,20 +15,39 @@ def _split_indices(
         min_heldout_points=1,
         random_state=0,
         strategy="random",
+        force_train_indices=None,
 ):
+    force_train_indices = (
+        np.array([], dtype=int)
+        if force_train_indices is None
+        else np.unique(np.asarray(force_train_indices, dtype=int))
+    )
+    if np.any((force_train_indices < 0) | (force_train_indices >= n_obs)):
+        raise ValueError("force_train_indices contains indices outside the observation range.")
+
     if n_obs < min_train_points + min_heldout_points:
         raise ValueError(
             "Not enough observations to make the requested split: "
             f"{n_obs} available, {min_train_points + min_heldout_points} required."
         )
 
+    candidate_heldout_indices = np.setdiff1d(np.arange(n_obs), force_train_indices)
+    if len(candidate_heldout_indices) < min_heldout_points:
+        raise ValueError(
+            "Not enough non-forced observations to make the requested held-out split: "
+            f"{len(candidate_heldout_indices)} available, {min_heldout_points} required."
+        )
+
     n_heldout = int(np.ceil(n_obs * heldout_fraction))
     n_heldout = max(min_heldout_points, n_heldout)
     n_heldout = min(n_heldout, n_obs - min_train_points)
+    n_heldout = min(n_heldout, len(candidate_heldout_indices))
 
     if strategy == "random":
         rng = np.random.default_rng(random_state)
-        heldout_indices = np.sort(rng.choice(n_obs, size=n_heldout, replace=False))
+        heldout_indices = np.sort(
+            rng.choice(candidate_heldout_indices, size=n_heldout, replace=False)
+        )
     else:
         raise ValueError(f"Unsupported split strategy: {strategy}")
 
@@ -44,6 +63,8 @@ def split_train_heldout_observations(
         min_heldout_points=1,
         random_state=0,
         strategy="random",
+        force_peak_in_train=False,
+        peak_mode="absolute",
 ):
     """
     Split one processed light curve into train and held-out observations.
@@ -55,11 +76,18 @@ def split_train_heldout_observations(
         min_heldout_points: Minimum number of observations held out.
         random_state: Seed used when strategy="random".
         strategy: only support "random"
+        force_peak_in_train: If True, keep the peak-flux observation out of held-out data.
+        peak_mode: "absolute" or "positive"; used when force_peak_in_train=True.
     Returns:
         (train_data, heldout_data), each with the same keys as data plus
         train_indices/heldout_indices metadata.
     """
     n_obs = len(data["y"])
+    force_train_indices = (
+        _find_peak_indices(data["y"], peak_mode=peak_mode)
+        if force_peak_in_train
+        else None
+    )
     train_indices, heldout_indices = _split_indices(
         n_obs,
         heldout_fraction=heldout_fraction,
@@ -67,6 +95,7 @@ def split_train_heldout_observations(
         min_heldout_points=min_heldout_points,
         random_state=random_state,
         strategy=strategy,
+        force_train_indices=force_train_indices,
     )
     train_indices = train_indices[np.argsort(np.asarray(data["t"])[train_indices])]
     heldout_indices = heldout_indices[np.argsort(np.asarray(data["t"])[heldout_indices])]
@@ -94,6 +123,21 @@ def _extract_valid_band_observations(example, target_band):
     order = np.argsort(t)
 
     return t[order], y[order], yerr[order]
+
+
+def _find_peak_indices(y, peak_mode="absolute"):
+    y = np.asarray(y)
+    if len(y) == 0:
+        return np.array([], dtype=int)
+
+    if peak_mode == "absolute":
+        peak_values = np.abs(y)
+    elif peak_mode == "positive":
+        peak_values = y
+    else:
+        raise ValueError(f"Unsupported peak_mode: {peak_mode}")
+
+    return np.flatnonzero(np.isclose(peak_values, np.max(peak_values)))
 
 
 def _find_alignment_peak_time(example, target_band, t, y, peak_alignment):
@@ -154,7 +198,88 @@ def find_global_percentile_flux_peak(examples, target_band, percentile=99, min_p
 
     return percentile_based_peak_flux
 
+def bitweight_location(y, c=6.0, eps=1e-12, max_iter=50, tol=1e-8):
+    """
+    Estimate robust background location and scale.
+    """
+    y = np.asarray(y, dtype=float)
+    y = y[np.isfinite(y)]
 
+    if len(y) == 0:
+        return np.nan, np.nan
+    
+    # initial robust center and scale
+    T = np.median(y)  
+    S = np.median(np.abs(y - T)) * 1.4826   # scale estimate based on MAD, multiplied by 1.4826 for consistency with std under normal distribution
+
+    if S < eps:
+        q25, q75 = np.percentile(y, [25, 75])
+        S = (q75 - q25) / 1.349
+    if S < eps: 
+        return T, S
+    
+    for _ in range(max_iter):
+        u = (y - T) / (c * S)
+        
+        mask = np.abs(u) < 1   # only consider points within the cutoff for weighting; others get zero weight
+        if not np.any(mask):
+            return T, S
+        
+        # compute weights
+        w = np.zeros_like(y)
+        w[mask] = (1 - u[mask]**2)**2  # Tukey's biweight function,
+        # It gives high weight to central points and low weight to moderately far points.
+
+        T_new = np.sum(w * y) / np.sum(w)
+        if abs(T_new - T) < tol:   # convergence check
+            return T_new, S
+
+        T = T_new
+
+    return T, S
+
+
+def _resolve_background_and_scale(
+        y,
+        flux_scale=None,
+        subtract_background=False,
+        background_flux=None,
+        background_estimator=bitweight_location,
+):
+    if not subtract_background:
+        return 0.0, flux_scale
+
+    estimated_background, estimated_scale = background_estimator(y)
+    if background_flux is not None:
+        resolved_background = float(background_flux)
+    else:
+        resolved_background = float(estimated_background)
+    if not np.isfinite(resolved_background):
+        raise ValueError("Estimated background_flux is not finite.")
+
+    resolved_scale = flux_scale
+    if resolved_scale is None:
+        resolved_scale = float(estimated_scale)
+        if not np.isfinite(resolved_scale) or resolved_scale <= 0:
+            raise ValueError("Estimated background scale is not finite and positive.")
+
+    return resolved_background, resolved_scale
+
+
+def inverse_transform_flux_from_gp(y_gp, data):
+    """
+    Transform GP-space flux back to raw flux.
+    """
+    return np.asarray(y_gp) * data["flux_scale"] + data.get("background_flux", 0.0)
+
+
+def inverse_transform_flux_err_from_gp(yerr_gp, data):
+    """
+    Transform GP-space flux uncertainty back to raw flux uncertainty.
+    """
+    return np.asarray(yerr_gp) * data["flux_scale"]
+
+    
 def select_examples_and_global_flux_scale(
         examples,
         target_band='r',
@@ -195,6 +320,9 @@ def process_one_obj_one_band(
         target_band='r',
         align_peak=True,
         peak_alignment="target_peak",
+        subtract_background=False,
+        background_flux=None,
+        background_estimator=bitweight_location,
         normalize_flux=True,
         min_points=5,
 ):
@@ -206,6 +334,9 @@ def process_one_obj_one_band(
         target_band: the band to process (e.g., 'r').
         align_peak: whether to align the peak of the light curve to time zero.
         peak_alignment: "target_peak", "target_abs_peak", "global_peak", or "global_abs_peak".
+        subtract_background: whether to subtract an estimated base flux before fitting the GP.
+        background_flux: optional fixed base flux. If None and subtract_background=True, estimate it from the object's flux.
+        background_estimator: callable used to estimate the base flux from raw flux values.
         normalize_flux: whether to normalize the flux values by the peak flux.
         min_points: minimum number of data points required to keep the example.
     Returns:
@@ -216,6 +347,15 @@ def process_one_obj_one_band(
     # Check if there are enough points
     if len(t) < min_points:
         return None
+
+    background_flux, background_scale = _resolve_background_and_scale(
+        y,
+        flux_scale=flux_scale,
+        subtract_background=subtract_background,
+        background_flux=background_flux,
+        background_estimator=background_estimator,
+    )
+    y_gp = y - background_flux
 
     # Align peak if required
     if align_peak:
@@ -242,20 +382,26 @@ def process_one_obj_one_band(
     # Normalize flux if required
     if normalize_flux:
         if flux_scale is None:
-            peak_flux = np.max(np.abs(y))
+            if subtract_background:
+                if background_scale is None:
+                    return None
+                peak_flux = float(background_scale)
+            else:
+                peak_flux = float(np.max(np.abs(y_gp)))
             if peak_flux <= 0:
                 return None
-            flux_scale = peak_flux
         else:
-            peak_flux = flux_scale
-        y = y / flux_scale
-        yerr = yerr / flux_scale
+            peak_flux = float(flux_scale)
+        resolved_flux_scale = peak_flux
+        y = y_gp / resolved_flux_scale
+        yerr = yerr / resolved_flux_scale
     else:
         # If not normalizing, we can still filter out examples with non-positive peak flux
-        if np.max(np.abs(y)) <= 0:
+        if np.max(np.abs(y_gp)) <= 0:
             return None
         peak_flux = 1.0
-        flux_scale = 1.0
+        resolved_flux_scale = 1.0
+        y = y_gp
     
     # sklearn expects X shape = (n_samples, n_features)
     X = t.reshape(-1, 1)
@@ -273,7 +419,9 @@ def process_one_obj_one_band(
         'alignment_peak_time': alignment_peak_time,
         'peak_alignment': peak_alignment,
         'peak_flux': peak_flux,
-        'flux_scale': flux_scale,
+        'flux_scale': resolved_flux_scale,
+        'background_flux': background_flux,
+        'subtract_background': subtract_background,
     }
 
 
@@ -286,13 +434,15 @@ def _make_processed_subset(
         alignment_peak_time,
         t_scale,
         flux_scale,
+        background_flux,
+        subtract_background,
         peak_flux,
         peak_alignment,
         train_indices=None,
         heldout_indices=None,
 ):
     t = (t_raw - alignment_peak_time) / t_scale
-    y = y_raw / flux_scale
+    y = (y_raw - background_flux) / flux_scale
     yerr = yerr_raw / flux_scale
     X = t.reshape(-1, 1)
 
@@ -310,6 +460,8 @@ def _make_processed_subset(
         'peak_alignment': peak_alignment,
         'peak_flux': peak_flux,
         'flux_scale': flux_scale,
+        'background_flux': background_flux,
+        'subtract_background': subtract_background,
         't_scale': t_scale,
     }
     if train_indices is not None:
@@ -326,6 +478,11 @@ def process_one_obj_one_band_train_heldout(
         target_band='r',
         align_peak=True,
         peak_alignment="target_peak",
+        peak_mode="absolute",
+        force_peak_in_train=True,
+        subtract_background=False,
+        background_flux=None,
+        background_estimator=bitweight_location,
         normalize_flux=True,
         min_points=8,
         heldout_fraction=0.2,
@@ -338,10 +495,19 @@ def process_one_obj_one_band_train_heldout(
     Split raw observations first, then fit preprocessing from training data only.
 
     This avoids leakage from held-out points into peak alignment and time scaling.
+    By default, the object's peak-flux observation is forced into train_data and
+    excluded from heldout_data.
+    Background and scale are fit from training data only, then reused for held-out data.
     """
     t_raw, y_raw, yerr_raw = _extract_valid_band_observations(example, target_band)
     if len(t_raw) < min_points:
         return None, None
+
+    force_train_indices = (
+        _find_peak_indices(y_raw, peak_mode=peak_mode)
+        if force_peak_in_train
+        else None
+    )
 
     train_indices, heldout_indices = _split_indices(
         len(t_raw),
@@ -350,6 +516,7 @@ def process_one_obj_one_band_train_heldout(
         min_heldout_points=min_heldout_points,
         random_state=random_state,
         strategy=strategy,
+        force_train_indices=force_train_indices,
     )
     train_indices = train_indices[np.argsort(t_raw[train_indices])]
     heldout_indices = heldout_indices[np.argsort(t_raw[heldout_indices])]
@@ -360,6 +527,16 @@ def process_one_obj_one_band_train_heldout(
     heldout_t_raw = t_raw[heldout_indices]
     heldout_y_raw = y_raw[heldout_indices]
     heldout_yerr_raw = yerr_raw[heldout_indices]
+
+    background_flux, background_scale = _resolve_background_and_scale(
+        train_y_raw,
+        flux_scale=flux_scale,
+        subtract_background=subtract_background,
+        background_flux=background_flux,
+        background_estimator=background_estimator,
+    )
+    print(f"Resolved background_flux={background_flux}, background_scale={background_scale}")
+    train_y_gp_raw = train_y_raw - background_flux
 
     if align_peak:
         # Use only target-band training observations to avoid leakage.
@@ -382,17 +559,22 @@ def process_one_obj_one_band_train_heldout(
 
     if normalize_flux:
         if flux_scale is None:
-            peak_flux = np.max(np.abs(train_y_raw))
+            if subtract_background:
+                if background_scale is None:
+                    return None, None
+                peak_flux = float(background_scale)
+            else:
+                peak_flux = float(np.max(np.abs(train_y_gp_raw)))
             if peak_flux <= 0:
                 return None, None
-            flux_scale = peak_flux
         else:
-            peak_flux = flux_scale
+            peak_flux = float(flux_scale)
+        resolved_flux_scale = peak_flux
     else:
-        if np.max(np.abs(train_y_raw)) <= 0:
+        if np.max(np.abs(train_y_gp_raw)) <= 0:
             return None, None
         peak_flux = 1.0
-        flux_scale = 1.0
+        resolved_flux_scale = 1.0
 
     train_data = _make_processed_subset(
         example,
@@ -402,7 +584,9 @@ def process_one_obj_one_band_train_heldout(
         train_yerr_raw,
         alignment_peak_time,
         t_scale,
-        flux_scale,
+        resolved_flux_scale,
+        background_flux,
+        subtract_background,
         peak_flux,
         peak_alignment,
         train_indices=train_indices,
@@ -415,7 +599,9 @@ def process_one_obj_one_band_train_heldout(
         heldout_yerr_raw,
         alignment_peak_time,
         t_scale,
-        flux_scale,
+        resolved_flux_scale,
+        background_flux,
+        subtract_background,
         peak_flux,
         peak_alignment,
         heldout_indices=heldout_indices,
