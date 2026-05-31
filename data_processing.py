@@ -246,6 +246,7 @@ def _resolve_background_and_scale(
         background_flux=None,
         background_estimator=bitweight_location,
         scale_mode="local_peak",
+        local_flux_percentile=99,
         eps=1e-12,
 ):
     y = np.asarray(y, dtype=float)
@@ -264,14 +265,16 @@ def _resolve_background_and_scale(
 
     centered_y = y - resolved_background
     if scale_mode == "local_peak":
-        resolved_scale = float(np.max(np.abs(centered_y)))
+        resolved_scale = float(np.percentile(np.abs(centered_y), local_flux_percentile))
+    #elif scale_mode == "local_max":
+        #resolved_scale = float(np.max(np.abs(centered_y)))
     elif scale_mode == "background_scale":
         if not subtract_background:
             raise ValueError("scale_mode='background_scale' requires subtract_background=True.")
         resolved_scale = float(estimated_scale)
-    elif scale_mode == "provided":
+    elif scale_mode == "global":
         if flux_scale is None:
-            raise ValueError("scale_mode='provided' requires flux_scale.")
+            raise ValueError("scale_mode='global' requires flux_scale.")
         resolved_scale = float(flux_scale)
     else:
         raise ValueError(f"Unsupported scale_mode: {scale_mode}")
@@ -280,6 +283,72 @@ def _resolve_background_and_scale(
         resolved_scale = float(eps)
 
     return resolved_background, resolved_scale
+
+
+def find_train_global_percentile_flux_peak(
+        examples,
+        target_band='r',
+        percentile=95,
+        min_points=8,
+        heldout_fraction=0.2,
+        min_train_points=5,
+        min_heldout_points=1,
+        random_state_offset=0,
+        strategy="random",
+        force_peak_in_train=True,
+        peak_mode="absolute",
+        subtract_background=False,
+        background_flux=None,
+        background_estimator=bitweight_location,
+):
+    """
+    Find a global percentile scale using training observations only.
+
+    The split settings must match the later train/held-out preprocessing call.
+    By default this uses random_state=object_idx, matching the notebook pattern.
+    """
+    flux_values = []
+    for object_idx, example in enumerate(examples):
+        t, y, _ = _extract_valid_band_observations(example, target_band)
+        if len(t) < min_points or np.std(t) <= 0:
+            continue
+
+        force_train_indices = (
+            _find_peak_indices(y, peak_mode=peak_mode)
+            if force_peak_in_train
+            else None
+        )
+        train_indices, _ = _split_indices(
+            len(t),
+            heldout_fraction=heldout_fraction,
+            min_train_points=min_train_points,
+            min_heldout_points=min_heldout_points,
+            random_state=random_state_offset + object_idx,
+            strategy=strategy,
+            force_train_indices=force_train_indices,
+        )
+
+        train_y = y[train_indices]
+        if subtract_background:
+            if background_flux is None:
+                resolved_background = float(background_estimator(train_y)[0])
+            else:
+                resolved_background = float(background_flux)
+            if not np.isfinite(resolved_background):
+                raise ValueError("Estimated background_flux is not finite.")
+            train_y = train_y - resolved_background
+
+        flux_values.append(np.abs(train_y))
+
+    if len(flux_values) == 0:
+        return None
+
+    flux_values = np.concatenate(flux_values)
+    percentile_based_peak_flux = np.percentile(flux_values, percentile)
+    if percentile_based_peak_flux <= 0:
+        raise ValueError("Computed train-only flux scale is zero or negative.")
+
+    return percentile_based_peak_flux
 
 
 def inverse_transform_predictions(mu_norm, var_norm, scale, background):
@@ -336,21 +405,14 @@ def summarize_preprocessing_scales(processed_data, label=None, print_summary=Tru
 
     return summary
 
-    
-def select_examples_and_global_flux_scale(
+
+def _select_usable_examples(
         examples,
         target_band='r',
         n_objects=300,
         max_examples_to_scan=3000,
-        percentile=99,
         min_points=8,
 ):
-    """
-    Select usable examples and compute a global flux scale from the same objects.
-
-    This is useful for streaming datasets: the selected examples are exactly the
-    examples that should later be used by the training/evaluation loop.
-    """
     selected_examples = []
     scanned_examples = 0
 
@@ -362,6 +424,80 @@ def select_examples_and_global_flux_scale(
         if _is_usable_one_band_example(example, target_band, min_points):
             selected_examples.append(example)
 
+    return selected_examples, scanned_examples
+
+
+def select_examples_and_train_global_flux_scale(
+        examples,
+        target_band='r',
+        n_objects=300,
+        max_examples_to_scan=3000,
+        percentile=99,
+        min_points=8,
+        heldout_fraction=0.2,
+        min_train_points=5,
+        min_heldout_points=1,
+        random_state=0,
+        strategy="random",
+        force_peak_in_train=True,
+        peak_mode="absolute",
+        subtract_background=False,
+        background_flux=None,
+        background_estimator=bitweight_location,
+):
+    """
+    Select usable examples and compute a global scale from training points only.
+    """
+    selected_examples, scanned_examples = _select_usable_examples(
+        examples,
+        target_band=target_band,
+        n_objects=n_objects,
+        max_examples_to_scan=max_examples_to_scan,
+        min_points=min_points,
+    )
+
+    flux_scale = find_train_global_percentile_flux_peak(
+        selected_examples,
+        target_band=target_band,
+        percentile=percentile,
+        min_points=min_points,
+        heldout_fraction=heldout_fraction,
+        min_train_points=min_train_points,
+        min_heldout_points=min_heldout_points,
+        random_state_offset=random_state,
+        strategy=strategy,
+        force_peak_in_train=force_peak_in_train,
+        peak_mode=peak_mode,
+        subtract_background=subtract_background,
+        background_flux=background_flux,
+        background_estimator=background_estimator,
+    )
+
+    return selected_examples, flux_scale, scanned_examples
+
+
+def select_examples_and_global_flux_scale(
+        examples,
+        target_band='r',
+        n_objects=300,
+        max_examples_to_scan=3000,
+        percentile=99,
+        min_points=8,
+):
+    """
+    Select usable examples and compute a global scale from all valid selected points.
+
+    This is kept for backward compatibility. For held-out calibration experiments,
+    prefer select_examples_and_train_global_flux_scale or
+    select_examples_and_process_train_heldout to avoid held-out leakage.
+    """
+    selected_examples, scanned_examples = _select_usable_examples(
+        examples,
+        target_band=target_band,
+        n_objects=n_objects,
+        max_examples_to_scan=max_examples_to_scan,
+        min_points=min_points,
+    )
     flux_scale = find_global_percentile_flux_peak(
         selected_examples,
         target_band=target_band,
@@ -370,6 +506,7 @@ def select_examples_and_global_flux_scale(
     )
 
     return selected_examples, flux_scale, scanned_examples
+
 
 def process_one_obj_one_band(
         example,
@@ -381,6 +518,7 @@ def process_one_obj_one_band(
         background_flux=None,
         background_estimator=bitweight_location,
         scale_mode=None,
+        local_flux_percentile=99,
         scale_eps=1e-12,
         normalize_flux=True,
         min_points=5,
@@ -396,8 +534,9 @@ def process_one_obj_one_band(
         subtract_background: whether to subtract an estimated base flux before fitting the GP.
         background_flux: optional fixed base flux. If None and subtract_background=True, estimate it from the object's flux.
         background_estimator: callable used to estimate the base flux from raw flux values.
-        scale_mode: "local_peak", "background_scale", or "provided". Defaults to
+        scale_mode: "local_peak", "local_max", "background_scale", or "provided". Defaults to
             "background_scale" when subtract_background=True and "local_peak" otherwise.
+        local_flux_percentile: Percentile of local absolute flux to use when scale_mode="local_peak".
         scale_eps: Small positive fallback for zero scales.
         normalize_flux: whether to normalize the flux values by the peak flux.
         min_points: minimum number of data points required to keep the example.
@@ -420,6 +559,7 @@ def process_one_obj_one_band(
         background_flux=background_flux,
         background_estimator=background_estimator,
         scale_mode=scale_mode,
+        local_flux_percentile=local_flux_percentile,
         eps=scale_eps,
     )
     y_gp = y - background_flux
@@ -552,6 +692,7 @@ def process_one_obj_one_band_train_heldout(
         background_flux=None,
         background_estimator=bitweight_location,
         scale_mode=None,
+        local_flux_percentile=95,
         scale_eps=1e-12,
         normalize_flux=True,
         min_points=8,
@@ -608,6 +749,7 @@ def process_one_obj_one_band_train_heldout(
         background_flux=background_flux,
         background_estimator=background_estimator,
         scale_mode=scale_mode,
+        local_flux_percentile=local_flux_percentile,
         eps=scale_eps,
     )
     train_y_gp_raw = train_y_raw - background_flux
@@ -618,7 +760,7 @@ def process_one_obj_one_band_train_heldout(
             example,
             target_band,
             train_t_raw,
-            train_y_raw,
+            train_y_gp_raw,
             peak_alignment if not peak_alignment.startswith("global") else "target_abs_peak",
         )
         if alignment_peak_time is None:
@@ -676,3 +818,112 @@ def process_one_obj_one_band_train_heldout(
     )
 
     return train_data, heldout_data
+
+
+def select_examples_and_process_train_heldout(
+        examples,
+        target_band='r',
+        n_objects=300,
+        max_examples_to_scan=3000,
+        global_flux_percentile=95,
+        flux_scale=None,
+        align_peak=True,
+        peak_alignment="target_peak",
+        peak_mode="absolute",
+        force_peak_in_train=True,
+        subtract_background=False,
+        background_flux=None,
+        background_estimator=bitweight_location,
+        scale_mode=None,
+        local_flux_percentile=95,
+        scale_eps=1e-12,
+        normalize_flux=True,
+        min_points=8,
+        heldout_fraction=0.2,
+        min_train_points=5,
+        min_heldout_points=1,
+        random_state=0,
+        strategy="random",
+):
+    """
+    Select examples, fit any requested global scale from train points only, then process splits.
+
+    This keeps split parameters in one place. If scale_mode="global" and flux_scale is
+    None, the global scale is computed from training observations only using the same
+    split settings that are then used for process_one_obj_one_band_train_heldout.
+    """
+    selected_examples, scanned_examples = _select_usable_examples(
+        examples,
+        target_band=target_band,
+        n_objects=n_objects,
+        max_examples_to_scan=max_examples_to_scan,
+        min_points=min_points,
+    )
+
+    resolved_scale_mode = scale_mode
+    if resolved_scale_mode is None:
+        resolved_scale_mode = "background_scale" if subtract_background else "local_peak"
+
+    if resolved_scale_mode == "global" and flux_scale is None:
+        # If the caller requested a global scale but didn't give one, compute it from training data only to avoid held-out leakage.
+        flux_scale = find_train_global_percentile_flux_peak(  
+            selected_examples,
+            target_band=target_band,
+            percentile=global_flux_percentile,
+            min_points=min_points,
+            heldout_fraction=heldout_fraction,
+            min_train_points=min_train_points,
+            min_heldout_points=min_heldout_points,
+            random_state_offset=random_state,
+            strategy=strategy,
+            force_peak_in_train=force_peak_in_train,
+            peak_mode=peak_mode,
+            subtract_background=subtract_background,
+            background_flux=background_flux,
+            background_estimator=background_estimator,
+        )
+
+    processed_objects = []
+    skipped_indices = []
+    for object_idx, example in enumerate(selected_examples):
+        train_data, heldout_data = process_one_obj_one_band_train_heldout(
+            example,
+            flux_scale=flux_scale,
+            target_band=target_band,
+            align_peak=align_peak,
+            peak_alignment=peak_alignment,
+            peak_mode=peak_mode,
+            force_peak_in_train=force_peak_in_train,
+            subtract_background=subtract_background,
+            background_flux=background_flux,
+            background_estimator=background_estimator,
+            scale_mode=resolved_scale_mode,
+            local_flux_percentile=local_flux_percentile,
+            scale_eps=scale_eps,
+            normalize_flux=normalize_flux,
+            min_points=min_points,
+            heldout_fraction=heldout_fraction,
+            min_train_points=min_train_points,
+            min_heldout_points=min_heldout_points,
+            random_state=random_state + object_idx,
+            strategy=strategy,
+        )
+        if train_data is None or heldout_data is None:
+            skipped_indices.append(object_idx)
+            continue
+
+        processed_objects.append({
+            "object_idx": object_idx,
+            "example": example,
+            "train_data": train_data,
+            "heldout_data": heldout_data,
+        })
+
+    return {
+        "selected_examples": selected_examples,
+        "processed_objects": processed_objects,
+        "flux_scale": flux_scale,
+        "scanned_examples": scanned_examples,
+        "skipped_indices": skipped_indices,
+        "scale_mode": resolved_scale_mode,
+    }
