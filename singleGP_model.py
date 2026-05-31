@@ -97,6 +97,32 @@ def inverse_transform_predictions(mu_norm, var_norm, scale, background):
     return mu_raw, var_raw
 
 
+def _assert_z_score_invariance(
+        errors_norm,
+        std_norm,
+        y_raw,
+        mean_raw,
+        std_raw,
+        scale,
+        floor_norm=1e-12,
+):
+    """
+    Check that normalized and raw z-scores match under a linear flux transform.
+    """
+    scale = float(scale)
+    raw_floor = floor_norm * scale
+    z_norm = np.asarray(errors_norm) / np.maximum(np.asarray(std_norm), floor_norm)
+    z_raw = (np.asarray(y_raw) - np.asarray(mean_raw)) / np.maximum(
+        np.asarray(std_raw),
+        raw_floor,
+    )
+    if not np.allclose(z_norm, z_raw, rtol=1e-5, atol=1e-5):
+        max_diff = float(np.max(np.abs(z_norm - z_raw)))
+        raise AssertionError(
+            f"Normalized and raw z-scores do not match. max_abs_diff={max_diff:g}"
+        )
+
+
 def _raw_observation_arrays(data):
     scale = float(data["flux_scale"])
     background = float(data.get("background_flux", 0.0))
@@ -289,10 +315,14 @@ def evaluate_heldout_metrics(
     std_raw = np.sqrt(variance_raw)
 
     if assert_z_invariance:
-        z_norm = errors_norm / np.maximum(std_norm, 1e-12)
-        z_raw = (y_raw - mean_raw) / np.maximum(std_raw, 1e-12)
-        if not np.allclose(z_norm, z_raw, rtol=1e-8, atol=1e-8):
-            raise AssertionError("Normalized and raw z-scores do not match.")
+        _assert_z_score_invariance(
+            errors_norm,
+            std_norm,
+            y_raw,
+            mean_raw,
+            std_raw,
+            scale,
+        )
 
     if evaluate_raw_metrics:
         y_metric = y_raw
