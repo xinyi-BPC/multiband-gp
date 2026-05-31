@@ -245,25 +245,53 @@ def _resolve_background_and_scale(
         subtract_background=False,
         background_flux=None,
         background_estimator=bitweight_location,
+        scale_mode="local_peak",
+        eps=1e-12,
 ):
-    if not subtract_background:
-        return 0.0, flux_scale
+    y = np.asarray(y, dtype=float)
 
-    estimated_background, estimated_scale = background_estimator(y)
-    if background_flux is not None:
-        resolved_background = float(background_flux)
+    if subtract_background:
+        estimated_background, estimated_scale = background_estimator(y)
+        if background_flux is not None:
+            resolved_background = float(background_flux)
+        else:
+            resolved_background = float(estimated_background)
+        if not np.isfinite(resolved_background):
+            raise ValueError("Estimated background_flux is not finite.")
     else:
-        resolved_background = float(estimated_background)
-    if not np.isfinite(resolved_background):
-        raise ValueError("Estimated background_flux is not finite.")
+        estimated_scale = np.nan
+        resolved_background = 0.0
 
-    resolved_scale = flux_scale
-    if resolved_scale is None:
+    centered_y = y - resolved_background
+    if scale_mode == "local_peak":
+        resolved_scale = float(np.max(np.abs(centered_y)))
+    elif scale_mode == "background_scale":
+        if not subtract_background:
+            raise ValueError("scale_mode='background_scale' requires subtract_background=True.")
         resolved_scale = float(estimated_scale)
-        if not np.isfinite(resolved_scale) or resolved_scale <= 0:
-            raise ValueError("Estimated background scale is not finite and positive.")
+    elif scale_mode == "provided":
+        if flux_scale is None:
+            raise ValueError("scale_mode='provided' requires flux_scale.")
+        resolved_scale = float(flux_scale)
+    else:
+        raise ValueError(f"Unsupported scale_mode: {scale_mode}")
+
+    if not np.isfinite(resolved_scale) or resolved_scale <= eps:
+        resolved_scale = float(eps)
 
     return resolved_background, resolved_scale
+
+
+def inverse_transform_predictions(mu_norm, var_norm, scale, background):
+    """
+    Transform normalized predictive mean and variance back to raw flux units.
+    """
+    scale = float(scale)
+    background = float(background)
+    mu_raw = np.asarray(mu_norm) * scale + background
+    var_raw = np.asarray(var_norm) * scale ** 2
+
+    return mu_raw, var_raw
 
 
 def inverse_transform_flux_from_gp(y_gp, data):
@@ -278,6 +306,35 @@ def inverse_transform_flux_err_from_gp(yerr_gp, data):
     Transform GP-space flux uncertainty back to raw flux uncertainty.
     """
     return np.asarray(yerr_gp) * data["flux_scale"]
+
+
+def summarize_preprocessing_scales(processed_data, label=None, print_summary=True):
+    """
+    Summarize per-object preprocessing scales and validate that they are usable.
+    """
+    scales = np.asarray([data["flux_scale"] for data in processed_data], dtype=float)
+    if len(scales) == 0:
+        raise ValueError("processed_data must contain at least one object.")
+    if np.any(~np.isfinite(scales)) or np.any(scales <= 0):
+        raise ValueError("All preprocessing scales must be finite and positive.")
+
+    summary = {
+        "label": label,
+        "n_objects": int(len(scales)),
+        "min_scale": float(np.min(scales)),
+        "median_scale": float(np.median(scales)),
+        "max_scale": float(np.max(scales)),
+    }
+    if print_summary:
+        prefix = f"{label}: " if label else ""
+        print(
+            f"{prefix}scale min={summary['min_scale']:.6g}, "
+            f"median={summary['median_scale']:.6g}, "
+            f"max={summary['max_scale']:.6g}, "
+            f"n={summary['n_objects']}"
+        )
+
+    return summary
 
     
 def select_examples_and_global_flux_scale(
@@ -323,6 +380,8 @@ def process_one_obj_one_band(
         subtract_background=False,
         background_flux=None,
         background_estimator=bitweight_location,
+        scale_mode=None,
+        scale_eps=1e-12,
         normalize_flux=True,
         min_points=5,
 ):
@@ -330,13 +389,16 @@ def process_one_obj_one_band(
     Process one object in one band.
     Args:
         example: a dictionary containing the light curve data for <one object>.
-        flux_scale: a global flux scale to use for normalization, or None to use the peak flux of this example.
+        flux_scale: scale to use only when scale_mode="provided".
         target_band: the band to process (e.g., 'r').
         align_peak: whether to align the peak of the light curve to time zero.
         peak_alignment: "target_peak", "target_abs_peak", "global_peak", or "global_abs_peak".
         subtract_background: whether to subtract an estimated base flux before fitting the GP.
         background_flux: optional fixed base flux. If None and subtract_background=True, estimate it from the object's flux.
         background_estimator: callable used to estimate the base flux from raw flux values.
+        scale_mode: "local_peak", "background_scale", or "provided". Defaults to
+            "background_scale" when subtract_background=True and "local_peak" otherwise.
+        scale_eps: Small positive fallback for zero scales.
         normalize_flux: whether to normalize the flux values by the peak flux.
         min_points: minimum number of data points required to keep the example.
     Returns:
@@ -348,12 +410,17 @@ def process_one_obj_one_band(
     if len(t) < min_points:
         return None
 
-    background_flux, background_scale = _resolve_background_and_scale(
+    if scale_mode is None:
+        scale_mode = "background_scale" if subtract_background else "local_peak"
+
+    background_flux, resolved_scale = _resolve_background_and_scale(
         y,
         flux_scale=flux_scale,
         subtract_background=subtract_background,
         background_flux=background_flux,
         background_estimator=background_estimator,
+        scale_mode=scale_mode,
+        eps=scale_eps,
     )
     y_gp = y - background_flux
 
@@ -381,17 +448,9 @@ def process_one_obj_one_band(
 
     # Normalize flux if required
     if normalize_flux:
-        if flux_scale is None:
-            if subtract_background:
-                if background_scale is None:
-                    return None
-                peak_flux = float(background_scale)
-            else:
-                peak_flux = float(np.max(np.abs(y_gp)))
-            if peak_flux <= 0:
-                return None
-        else:
-            peak_flux = float(flux_scale)
+        peak_flux = float(resolved_scale)
+        if not np.isfinite(peak_flux) or peak_flux <= 0:
+            return None
         resolved_flux_scale = peak_flux
         y = y_gp / resolved_flux_scale
         yerr = yerr / resolved_flux_scale
@@ -411,6 +470,8 @@ def process_one_obj_one_band(
         't': t,
         'y': y,
         'yerr': yerr,
+        'y_raw': y_gp + background_flux,
+        'yerr_raw': yerr * resolved_flux_scale,
         'band': target_band,
         'obj_type': example['obj_type'],
         'obj_id': example['object_id'],
@@ -420,6 +481,8 @@ def process_one_obj_one_band(
         'peak_alignment': peak_alignment,
         'peak_flux': peak_flux,
         'flux_scale': resolved_flux_scale,
+        'scale': resolved_flux_scale,
+        'scale_mode': scale_mode,
         'background_flux': background_flux,
         'subtract_background': subtract_background,
     }
@@ -438,6 +501,7 @@ def _make_processed_subset(
         subtract_background,
         peak_flux,
         peak_alignment,
+        scale_mode,
         train_indices=None,
         heldout_indices=None,
 ):
@@ -451,6 +515,8 @@ def _make_processed_subset(
         't': t,
         'y': y,
         'yerr': yerr,
+        'y_raw': y_raw,
+        'yerr_raw': yerr_raw,
         'band': target_band,
         'obj_type': example['obj_type'],
         'obj_id': example['object_id'],
@@ -460,6 +526,8 @@ def _make_processed_subset(
         'peak_alignment': peak_alignment,
         'peak_flux': peak_flux,
         'flux_scale': flux_scale,
+        'scale': flux_scale,
+        'scale_mode': scale_mode,
         'background_flux': background_flux,
         'subtract_background': subtract_background,
         't_scale': t_scale,
@@ -483,6 +551,8 @@ def process_one_obj_one_band_train_heldout(
         subtract_background=False,
         background_flux=None,
         background_estimator=bitweight_location,
+        scale_mode=None,
+        scale_eps=1e-12,
         normalize_flux=True,
         min_points=8,
         heldout_fraction=0.2,
@@ -528,14 +598,18 @@ def process_one_obj_one_band_train_heldout(
     heldout_y_raw = y_raw[heldout_indices]
     heldout_yerr_raw = yerr_raw[heldout_indices]
 
-    background_flux, background_scale = _resolve_background_and_scale(
+    if scale_mode is None:
+        scale_mode = "background_scale" if subtract_background else "local_peak"
+
+    background_flux, resolved_scale = _resolve_background_and_scale(
         train_y_raw,
         flux_scale=flux_scale,
         subtract_background=subtract_background,
         background_flux=background_flux,
         background_estimator=background_estimator,
+        scale_mode=scale_mode,
+        eps=scale_eps,
     )
-    print(f"Resolved background_flux={background_flux}, background_scale={background_scale}")
     train_y_gp_raw = train_y_raw - background_flux
 
     if align_peak:
@@ -558,17 +632,9 @@ def process_one_obj_one_band_train_heldout(
         return None, None
 
     if normalize_flux:
-        if flux_scale is None:
-            if subtract_background:
-                if background_scale is None:
-                    return None, None
-                peak_flux = float(background_scale)
-            else:
-                peak_flux = float(np.max(np.abs(train_y_gp_raw)))
-            if peak_flux <= 0:
-                return None, None
-        else:
-            peak_flux = float(flux_scale)
+        peak_flux = float(resolved_scale)
+        if not np.isfinite(peak_flux) or peak_flux <= 0:
+            return None, None
         resolved_flux_scale = peak_flux
     else:
         if np.max(np.abs(train_y_gp_raw)) <= 0:
@@ -589,6 +655,7 @@ def process_one_obj_one_band_train_heldout(
         subtract_background,
         peak_flux,
         peak_alignment,
+        scale_mode,
         train_indices=train_indices,
     )
     heldout_data = _make_processed_subset(
@@ -604,6 +671,7 @@ def process_one_obj_one_band_train_heldout(
         subtract_background,
         peak_flux,
         peak_alignment,
+        scale_mode,
         heldout_indices=heldout_indices,
     )
 

@@ -5,6 +5,7 @@ from singleGP_model import (
     evaluate_heldout_rmse,
     extract_basic_gp_features,
     fit_basic_gp,
+    inverse_transform_predictions,
     largest_standardized_residual_cases,
     negative_log_predictive_density,
     print_largest_standardized_residual_cases,

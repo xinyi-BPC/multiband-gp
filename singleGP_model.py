@@ -79,10 +79,34 @@ def predict_observation_distribution(
     if return_raw_flux:
         flux_scale = data["flux_scale"]
         background_flux = data.get("background_flux", 0.0)
-        mean = mean * flux_scale + background_flux
-        variance = variance * flux_scale ** 2
+        mean = mean * flux_scale + background_flux   # recover raw flux mean
+        variance = variance * flux_scale ** 2      # recover raw flux variance
 
     return mean, np.sqrt(variance), variance
+
+
+def inverse_transform_predictions(mu_norm, var_norm, scale, background):
+    """
+    Transform normalized predictive mean and variance back to raw flux units.
+    """
+    scale = float(scale)
+    background = float(background)
+    mu_raw = np.asarray(mu_norm) * scale + background
+    var_raw = np.asarray(var_norm) * scale ** 2
+
+    return mu_raw, var_raw
+
+
+def _raw_observation_arrays(data):
+    scale = float(data["flux_scale"])
+    background = float(data.get("background_flux", 0.0))
+    y_norm = np.asarray(data["y"])
+    yerr_norm = np.asarray(data["yerr"])
+
+    y_raw = np.asarray(data.get("y_raw", y_norm * scale + background))
+    yerr_raw = np.asarray(data.get("yerr_raw", yerr_norm * scale))
+
+    return y_raw, yerr_raw, scale, background
 
 
 def negative_log_predictive_density(y_true, mean, variance):
@@ -99,16 +123,26 @@ def RMSE(y_true, y_pred):
     """Compute root mean squared error."""
     return np.sqrt(np.mean((y_true - y_pred) ** 2))
 
-def evaluate_heldout_rmse(gp, heldout_data):
+def evaluate_heldout_rmse(gp, heldout_data, evaluate_raw_metrics=True):
     """
     Compare held-out observations with the GP predictive mean using RMSE.
     """
-    mean, _, _ = predict_observation_distribution(gp, heldout_data, include_yerr=False)
-    rmse = RMSE(heldout_data["y"], mean)
+    mean, _, _ = predict_observation_distribution(
+        gp,
+        heldout_data,
+        include_yerr=False,
+        return_raw_flux=evaluate_raw_metrics,
+    )
+    if evaluate_raw_metrics:
+        y_true, _, _, _ = _raw_observation_arrays(heldout_data)
+    else:
+        y_true = heldout_data["y"]
+    rmse = RMSE(y_true, mean)
 
     return {
         "rmse": float(rmse),
         "y_pred": mean,
+        "metric_space": "raw" if evaluate_raw_metrics else "normalized",
     }
 
 def evaluate_heldout_nlpd(
@@ -118,6 +152,7 @@ def evaluate_heldout_nlpd(
         yerr_scale=1.0,
         noise_floor=0.0,
         extra_noise=None,
+        evaluate_raw_metrics=True,
 ):
     """
     Compare held-out observations with the GP predictive distribution using NLPD.
@@ -129,9 +164,14 @@ def evaluate_heldout_nlpd(
         yerr_scale=yerr_scale,
         noise_floor=noise_floor,
         extra_noise=extra_noise,
+        return_raw_flux=evaluate_raw_metrics,
     )
+    if evaluate_raw_metrics:
+        y_true, _, _, _ = _raw_observation_arrays(heldout_data)
+    else:
+        y_true = heldout_data["y"]
     per_point_nlpd = negative_log_predictive_density(
-        heldout_data["y"],
+        y_true,
         mean,
         variance,
     )
@@ -143,6 +183,7 @@ def evaluate_heldout_nlpd(
         "y_pred": mean,
         "y_std": std,
         "predictive_variance": variance,
+        "metric_space": "raw" if evaluate_raw_metrics else "normalized",
     }
 
 def extract_basic_gp_features(gp, data, mode="observed", n_grid=200):
@@ -212,11 +253,14 @@ def evaluate_heldout_metrics(
         noise_floor=0.0,
         extra_noise=None,
         peak_window=0.25,
+        evaluate_raw_metrics=True,
+        assert_z_invariance=True,
 ):
     """
-    Evaluate NLPD, RMSE, and coverage for one object's held-out observations.
+    Evaluate coverage in normalized GP space and NLPD/RMSE in raw flux space by default.
+    If evaluate_raw_metrics=False, NLPD/RMSE are computed in normalized space instead.
     """
-    mean, std, variance = predict_observation_distribution(
+    mean_norm, std_norm, variance_norm = predict_observation_distribution(
         gp,
         heldout_data,
         include_yerr=include_yerr,
@@ -224,22 +268,53 @@ def evaluate_heldout_metrics(
         noise_floor=noise_floor,
         extra_noise=extra_noise,
     )
-    y_true = np.asarray(heldout_data["y"])
-    errors = y_true - mean
-    squared_errors = errors ** 2
-    per_point_nlpd = negative_log_predictive_density(y_true, mean, variance)
+    y_true_norm = np.asarray(heldout_data["y"])
+    errors_norm = y_true_norm - mean_norm
 
     coverage = {}
     coverage_counts = {}
     for sigma in coverage_sigmas:
-        covered = np.abs(errors) <= sigma * std
+        covered = np.abs(errors_norm) <= sigma * std_norm
         key = f"coverage_{sigma:g}sigma"
         coverage[key] = float(np.mean(covered))
         coverage_counts[key] = int(np.sum(covered))
 
-    n_heldout = len(y_true)
+    y_raw, yerr_raw, scale, background = _raw_observation_arrays(heldout_data)
+    mean_raw, variance_raw = inverse_transform_predictions(
+        mean_norm,
+        variance_norm,
+        scale,
+        background,
+    )
+    std_raw = np.sqrt(variance_raw)
+
+    if assert_z_invariance:
+        z_norm = errors_norm / np.maximum(std_norm, 1e-12)
+        z_raw = (y_raw - mean_raw) / np.maximum(std_raw, 1e-12)
+        if not np.allclose(z_norm, z_raw, rtol=1e-8, atol=1e-8):
+            raise AssertionError("Normalized and raw z-scores do not match.")
+
+    if evaluate_raw_metrics:
+        y_metric = y_raw
+        mean_metric = mean_raw
+        std_metric = std_raw
+        variance_metric = variance_raw
+        yerr_metric = yerr_raw
+        metric_space = "raw"
+    else:
+        y_metric = y_true_norm
+        mean_metric = mean_norm
+        std_metric = std_norm
+        variance_metric = variance_norm
+        yerr_metric = np.asarray(heldout_data["yerr"])
+        metric_space = "normalized"
+
+    errors_metric = y_metric - mean_metric
+    squared_errors = errors_metric ** 2
+    per_point_nlpd = negative_log_predictive_density(y_metric, mean_metric, variance_metric)
+
+    n_heldout = len(y_metric)
     t_test = np.asarray(heldout_data["t"])
-    yerr_test = np.asarray(heldout_data["yerr"])
     band = heldout_data.get("band", None)
     obj_id = heldout_data.get("obj_id", None)
 
@@ -271,7 +346,7 @@ def evaluate_heldout_metrics(
 
         peak_time = all_t[np.argmax(np.abs(all_y))]
     else:
-        peak_time = t_test[np.argmax(np.abs(y_true))]
+        peak_time = t_test[np.argmax(np.abs(y_true_norm))]
     near_peak = np.abs(t_test - peak_time) <= peak_window
 
     return {
@@ -279,6 +354,7 @@ def evaluate_heldout_metrics(
         "n_train": n_train,
         "train_time_min": train_time_min,
         "train_time_max": train_time_max,
+        "metric_space": metric_space,
         "mean_nlpd": float(np.mean(per_point_nlpd)),
         "total_nlpd": float(np.sum(per_point_nlpd)),
         "rmse": float(np.sqrt(np.mean(squared_errors))),
@@ -287,10 +363,18 @@ def evaluate_heldout_metrics(
         "coverage_counts": coverage_counts,
         "per_point_nlpd": per_point_nlpd,
         "squared_errors": squared_errors,
-        "y_true": y_true,
-        "y_pred": mean,
-        "y_std": std,
-        "yerr": yerr_test,
+        "y_true": y_metric,
+        "y_pred": mean_metric,
+        "y_std": std_metric,
+        "yerr": yerr_metric,
+        "y_true_norm": y_true_norm,
+        "y_pred_norm": mean_norm,
+        "y_std_norm": std_norm,
+        "predictive_variance_norm": variance_norm,
+        "y_true_raw": y_raw,
+        "y_pred_raw": mean_raw,
+        "y_std_raw": std_raw,
+        "yerr_raw": yerr_raw,
         "time": t_test,
         "X_test": np.asarray(heldout_data["X"]).reshape(n_heldout, -1),
         "object_id": np.repeat(obj_id, n_heldout),
@@ -298,7 +382,9 @@ def evaluate_heldout_metrics(
         "outside_train_range": outside_train_range,
         "distance_to_train_range": distance_to_train_range,
         "near_peak": near_peak,
-        "predictive_variance": variance,
+        "predictive_variance": variance_metric,
+        "flux_scale": scale,
+        "background_flux": background,
     }
 
 
