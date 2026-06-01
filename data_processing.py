@@ -911,6 +911,9 @@ def select_examples_and_process_train_heldout(
         if train_data is None or heldout_data is None:
             skipped_indices.append(object_idx)
             continue
+        print("total train:", len(train_data["y"]))
+        print("total heldout:", len(heldout_data["y"]))
+
 
         processed_objects.append({
             "object_idx": object_idx,
