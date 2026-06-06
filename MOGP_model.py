@@ -1,3 +1,4 @@
+from itertools import islice
 from typing import Any, cast
 
 import numpy as np
@@ -18,7 +19,7 @@ from singleGP_model import (
 )
 
 
-# LSST-like effective wavelengths in nanometers.  PLAsTiCC often stores bands
+# LSST-like effective wavelengths in nanometers. PLAsTiCC often stores bands
 # as 0..5, so both string and integer aliases are accepted by the resolver.
 DEFAULT_BAND_TO_WAVELENGTH = {
     "u": 367.1,
@@ -26,18 +27,18 @@ DEFAULT_BAND_TO_WAVELENGTH = {
     "r": 622.3,
     "i": 754.6,
     "z": 869.1,
+    "Y": 971.0,
     0: 367.1,
     1: 482.7,
     2: 622.3,
     3: 754.6,
     4: 869.1,
+    5: 971.0,
 }
 
 
 def _resolve_wavelength(band, band_to_wavelength):
-    """
-    Resolve the wavelength for a given band using the provided mapping, with flexible key types.
-    """
+    """Resolve a band's configured effective wavelength."""
     if band in band_to_wavelength:
         return float(band_to_wavelength[band])
 
@@ -72,6 +73,163 @@ def _available_bands(example, bands, band_to_wavelength):
             usable.append(band)
 
     return usable
+
+
+def _rng_from_seed_or_rng(random_state=None, rng=None):
+    if rng is not None:
+        return rng
+    return np.random.default_rng(random_state)
+
+
+def _data_n_rows(data):
+    return len(np.asarray(data["band"]))
+
+
+def _subset_rows(data, indices):
+    indices = np.asarray(indices, dtype=int)
+    n_rows = _data_n_rows(data)
+    subset = data.copy()
+    for key, value in data.items():
+        if isinstance(value, np.ndarray) and len(value) == n_rows:
+            subset[key] = value[indices]
+        elif isinstance(value, list) and len(value) == n_rows:
+            subset[key] = [value[i] for i in indices]
+    return subset
+
+
+def _append_rows(first, second):
+    first_n = _data_n_rows(first)
+    merged = first.copy()
+    for key, first_value in first.items():
+        if key not in second:
+            continue
+        second_value = second[key]
+        if isinstance(first_value, np.ndarray) and len(first_value) == first_n:
+            merged[key] = np.concatenate([first_value, np.asarray(second_value)])
+        elif isinstance(first_value, list) and len(first_value) == first_n:
+            merged[key] = first_value + list(second_value)
+    for key, second_value in second.items():
+        if key not in merged:
+            merged[key] = second_value
+    return merged
+
+
+def _stack_raw_mogp_subset(example, bands, split_by_band, index_key):
+    t_parts = []
+    y_parts = []
+    yerr_parts = []
+    band_parts = []
+    index_parts = []
+    row_id_parts = []
+
+    for band in bands:
+        split = split_by_band[band]
+        indices = np.asarray(split[index_key], dtype=int)
+        if len(indices) == 0:
+            continue
+
+        t_parts.append(split["t_raw"][indices])
+        y_parts.append(split["y_raw"][indices])
+        yerr_parts.append(split["yerr_raw"][indices])
+        band_parts.append(np.full(len(indices), band, dtype=object))
+        index_parts.append(indices)
+        row_id_parts.append(np.asarray([f"{band}:{idx}" for idx in indices], dtype=object))
+
+    if len(t_parts) == 0:
+        return None
+
+    t_raw = np.concatenate(t_parts)
+    y_raw = np.concatenate(y_parts)
+    yerr_raw = np.concatenate(yerr_parts)
+    band = np.concatenate(band_parts)
+    source_indices = np.concatenate(index_parts)
+    row_id = np.concatenate(row_id_parts)
+
+    order = np.lexsort((band.astype(str), t_raw))
+    return {
+        "t_raw": t_raw[order],
+        "y_raw": y_raw[order],
+        "yerr_raw": yerr_raw[order],
+        "band": band[order],
+        "source_indices": source_indices[order],
+        "row_id": row_id[order],
+        "obj_type": example["obj_type"],
+        "obj_id": example["object_id"],
+    }
+
+
+def subsample_multiband_train_to_reference_band(
+        train_data,
+        test_data,
+        reference_band,
+        random_state=0,
+        rng=None,
+        preserve_peak=True,
+):
+    """
+    Reduce multiband train rows after the original split for fair comparison.
+
+    The reduced train size equals the number of original training rows in
+    reference_band. Non-selected original train rows are appended to test_data.
+    If preserve_peak=True, exactly one row with the maximum raw training flux
+    across all bands is forced into the reduced train set.
+    """
+    train_band = np.asarray(train_data["band"], dtype=object)
+    n_reference_train = int(np.sum(train_band == reference_band))
+    if n_reference_train <= 0:
+        raise ValueError(f"reference_band={reference_band!r} has no training rows.")
+
+    n_train = _data_n_rows(train_data)
+    if n_reference_train > n_train:
+        raise ValueError("Reference-band training count cannot exceed total training count.")
+
+    rng = _rng_from_seed_or_rng(random_state=random_state, rng=rng)
+    all_indices = np.arange(n_train)
+
+    if preserve_peak:
+        peak_index = int(np.argmax(np.asarray(train_data["y_raw"], dtype=float)))
+        remaining_needed = n_reference_train - 1
+        candidate_indices = np.setdiff1d(all_indices, [peak_index], assume_unique=True)
+        if remaining_needed > len(candidate_indices):
+            raise ValueError("Not enough non-peak rows to complete the reduced training set.")
+        sampled = (
+            np.array([], dtype=int)
+            if remaining_needed == 0
+            else rng.choice(candidate_indices, size=remaining_needed, replace=False)
+        )
+        selected_indices = np.sort(np.concatenate([[peak_index], sampled]))
+    else:
+        selected_indices = np.sort(rng.choice(all_indices, size=n_reference_train, replace=False))
+        peak_index = None
+
+    moved_indices = np.setdiff1d(all_indices, selected_indices, assume_unique=True)
+    reduced_train = _subset_rows(train_data, selected_indices)
+    moved_to_test = _subset_rows(train_data, moved_indices)
+    reduced_test = _append_rows(test_data, moved_to_test)
+
+    selected_row_ids = set(np.asarray(reduced_train.get("row_id", []), dtype=object).tolist())
+    moved_row_ids = set(np.asarray(moved_to_test.get("row_id", []), dtype=object).tolist())
+    if selected_row_ids and selected_row_ids.intersection(moved_row_ids):
+        raise AssertionError("Reduced train and moved-to-test rows overlap.")
+
+    peak_row_id = None if peak_index is None else train_data.get("row_id", [None] * n_train)[peak_index]
+    reduced_train["subsample_metadata"] = {
+        "reference_band": reference_band,
+        "n_reference_train": n_reference_train,
+        "selected_indices": selected_indices,
+        "moved_indices": moved_indices,
+        "preserve_peak": preserve_peak,
+        "peak_index": peak_index,
+        "peak_row_id": peak_row_id,
+    }
+    reduced_test["subsample_metadata"] = reduced_train["subsample_metadata"]
+
+    if _data_n_rows(reduced_train) != n_reference_train:
+        raise AssertionError("Reduced multiband train size does not match reference-band train size.")
+    if preserve_peak and peak_row_id not in set(np.asarray(reduced_train.get("row_id", []), dtype=object).tolist()):
+        raise AssertionError("Preserved peak row is missing from reduced train data.")
+
+    return reduced_train, reduced_test
 
 
 def _background_for_training_flux(
@@ -136,7 +294,7 @@ def _stack_mogp_subset(
 
     for band in bands:
         split = split_by_band[band]
-        indices = split[index_key]
+        indices = np.asarray(split[index_key], dtype=int)
         if len(indices) == 0:
             continue
 
@@ -158,6 +316,9 @@ def _stack_mogp_subset(
         yerr_raw_parts.append(yerr_raw)
         band_parts.append(np.full(len(t), band, dtype=object))
         index_parts.append(indices)
+
+    if len(t_parts) == 0:
+        return None
 
     t = np.concatenate(t_parts)
     wavelength = np.concatenate(wavelength_parts)
@@ -208,7 +369,7 @@ def _stack_mogp_subset(
 
 def process_one_obj_mogp_train_heldout(
         example,
-        bands=("u", "g", "r", "i", "z", 0, 1, 2, 3, 4),
+        bands=("u", "g", "r", "i", "z", "Y", 0, 1, 2, 3, 4, 5),
         band_to_wavelength=None,
         flux_scale=None,
         align_peak=True,
@@ -230,17 +391,20 @@ def process_one_obj_mogp_train_heldout(
         min_heldout_points=1,
         random_state=0,
         strategy="random",
+        subsample_reference_band=None,
+        preserve_peak=True,
+        subsample_random_state=None,
 ):
     """
-    Split each band with the same helper used by the single-band GP, then fit
-    one continuous GP over [time, wavelength].  This is not an ICM/LMC
-    coregionalization model
+    Split each band with the same helper used by the single-band GP, optionally
+    reduce the multiband train set after that split, then fit preprocessing from
+    training data only. This is a continuous time+wavelength GP baseline, not a
+    full ICM/LMC coregionalization model.
     """
     band_to_wavelength = band_to_wavelength or DEFAULT_BAND_TO_WAVELENGTH
     usable_bands = _available_bands(example, bands, band_to_wavelength)
 
     split_by_band = {}
-    train_by_band = {}
     for band in usable_bands:
         t_raw, y_raw, yerr_raw = _extract_valid_band_observations(example, band)
         if len(t_raw) < max(min_points_per_band, min_train_points + min_heldout_points):
@@ -280,11 +444,6 @@ def process_one_obj_mogp_train_heldout(
             "train_indices": train_indices,
             "heldout_indices": heldout_indices,
         }
-        train_by_band[band] = {
-            "t_raw": t_raw[train_indices],
-            "y_raw": y_raw[train_indices],
-            "yerr_raw": yerr_raw[train_indices],
-        }
 
     if len(split_by_band) == 0:
         return None, None
@@ -299,6 +458,56 @@ def process_one_obj_mogp_train_heldout(
     if scale_mode is None:
         scale_mode = "background_scale" if subtract_background else "local_peak"
 
+    if subsample_reference_band is not None:
+        raw_train_data = _stack_raw_mogp_subset(
+            example,
+            list(split_by_band.keys()),
+            split_by_band,
+            "train_indices",
+        )
+        raw_heldout_data = _stack_raw_mogp_subset(
+            example,
+            list(split_by_band.keys()),
+            split_by_band,
+            "heldout_indices",
+        )
+        if raw_train_data is None or raw_heldout_data is None:
+            return None, None
+
+        reduced_raw_train, reduced_raw_heldout = subsample_multiband_train_to_reference_band(
+            raw_train_data,
+            raw_heldout_data,
+            reference_band=subsample_reference_band,
+            random_state=random_state if subsample_random_state is None else subsample_random_state,
+            preserve_peak=preserve_peak,
+        )
+
+        for band, split in split_by_band.items():
+            train_mask = np.asarray(reduced_raw_train["band"], dtype=object) == band
+            heldout_mask = np.asarray(reduced_raw_heldout["band"], dtype=object) == band
+            split["train_indices"] = np.sort(
+                np.asarray(reduced_raw_train["source_indices"], dtype=int)[train_mask]
+            )
+            split["heldout_indices"] = np.sort(
+                np.asarray(reduced_raw_heldout["source_indices"], dtype=int)[heldout_mask]
+            )
+
+    train_by_band = {
+        band: {
+            "t_raw": split["t_raw"][split["train_indices"]],
+            "y_raw": split["y_raw"][split["train_indices"]],
+            "yerr_raw": split["yerr_raw"][split["train_indices"]],
+        }
+        for band, split in split_by_band.items()
+        if len(split["train_indices"]) > 0
+    }
+    if len(train_by_band) == 0:
+        return None, None
+    n_train_total = sum(len(v["train_indices"]) for v in split_by_band.values())
+    n_heldout_total = sum(len(v["heldout_indices"]) for v in split_by_band.values())
+    if n_train_total < min_train_points or n_heldout_total < min_heldout_points:
+        return None, None
+
     backgrounds = _background_for_training_flux(
         train_by_band,
         subtract_background=subtract_background,
@@ -306,6 +515,15 @@ def process_one_obj_mogp_train_heldout(
         background_estimator=background_estimator,
         background_mode=background_mode,
     )
+    if len(backgrounds) > 0:
+        fallback_background = next(iter(backgrounds.values()))
+    elif background_flux is not None:
+        fallback_background = float(background_flux)
+    else:
+        fallback_background = 0.0
+    for band in split_by_band:
+        if band not in backgrounds:
+            backgrounds[band] = fallback_background if background_mode == "object" else 0.0
 
     train_t_raw_all = np.concatenate([v["t_raw"] for v in train_by_band.values()])
     train_y_centered_all = np.concatenate([
@@ -378,6 +596,8 @@ def process_one_obj_mogp_train_heldout(
         scale_mode,
         peak_alignment,
     )
+    if train_data is None or heldout_data is None:
+        return None, None
 
     train_data["train_indices_by_band"] = {
         band: split["train_indices"] for band, split in split_by_band.items()
@@ -385,8 +605,102 @@ def process_one_obj_mogp_train_heldout(
     heldout_data["heldout_indices_by_band"] = {
         band: split["heldout_indices"] for band, split in split_by_band.items()
     }
+    if subsample_reference_band is not None:
+        train_data["subsample_reference_band"] = subsample_reference_band
+        heldout_data["subsample_reference_band"] = subsample_reference_band
 
     return train_data, heldout_data
+
+
+def find_reduced_mogp_train_global_percentile_flux_peak(
+        examples,
+        reference_band,
+        bands=("u", "g", "r", "i", "z", "Y", 0, 1, 2, 3, 4, 5),
+        percentile=95,
+        n_objects=None,
+        max_examples_to_scan=3000,
+        random_state=0,
+        preserve_peak=True,
+        subtract_background=False,
+        background_flux=None,
+        background_estimator=bitweight_location,
+        background_mode="object",
+        **process_kwargs,
+):
+    """
+    Compute a MOGP global flux scale from reduced multiband training rows only.
+
+    This is the multiband counterpart to the single-band train-only global
+    scale helper. It first performs the normal per-band split, then reduces
+    each object's multiband train set to the reference-band train count, and
+    finally pools only those reduced training fluxes.
+    """
+    flux_values = []
+    scanned = 0
+    used = 0
+    process_kwargs = {
+        key: value
+        for key, value in process_kwargs.items()
+        if key not in {
+            "random_state",
+            "subsample_reference_band",
+            "preserve_peak",
+            "subtract_background",
+            "background_flux",
+            "background_estimator",
+            "background_mode",
+            "normalize_flux",
+            "scale_mode",
+            "flux_scale",
+        }
+    }
+
+    for object_idx, example in enumerate(examples):
+        if object_idx >= max_examples_to_scan:
+            break
+        if n_objects is not None and used >= n_objects:
+            break
+        scanned = object_idx + 1
+
+        train_data, _ = process_one_obj_mogp_train_heldout(
+            example,
+            bands=bands,
+            random_state=random_state + object_idx,
+            subsample_reference_band=reference_band,
+            preserve_peak=preserve_peak,
+            subtract_background=subtract_background,
+            background_flux=background_flux,
+            background_estimator=background_estimator,
+            background_mode=background_mode,
+            normalize_flux=False,
+            scale_mode="local_peak",
+            **process_kwargs,
+        )
+        if train_data is None:
+            continue
+
+        centered_flux = np.asarray(train_data["y_raw"], dtype=float) - np.asarray(
+            train_data.get("background_flux", 0.0),
+            dtype=float,
+        )
+        flux_values.append(np.abs(centered_flux))
+        used += 1
+
+    if len(flux_values) == 0:
+        return None
+
+    flux_values = np.concatenate(flux_values)
+    scale = float(np.percentile(flux_values, percentile))
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("Computed reduced MOGP train-only global scale is not finite and positive.")
+
+    return {
+        "flux_scale": scale,
+        "percentile": percentile,
+        "n_objects": used,
+        "scanned_examples": scanned,
+        "reference_band": reference_band,
+    }
 
 
 def fit_mogp_gp(
@@ -404,9 +718,7 @@ def fit_mogp_gp(
         random_state=0,
         print_kernel=True,
 ):
-    """
-    Fit the minimal continuous time+wavelength GP baseline.
-    """
+    """Fit the minimal continuous time+wavelength GP baseline."""
     kernel = ConstantKernel(
         constant_value,
         constant_value_bounds,
@@ -665,7 +977,7 @@ def run_mogp_evaluation(
         **kwargs,
 ):
     """
-    Run a small comparison-friendly MOGP evaluation and return object-level,
+    Run a comparison-friendly MOGP evaluation and return object-level,
     aggregate, and per-band metrics.
     """
     if isinstance(examples, dict) and "lightcurve" in examples:
@@ -697,6 +1009,9 @@ def run_mogp_evaluation(
         "min_train_points",
         "min_heldout_points",
         "strategy",
+        "subsample_reference_band",
+        "preserve_peak",
+        "subsample_random_state",
     }
     fit_keys = {
         "time_length_scale",
@@ -716,6 +1031,48 @@ def run_mogp_evaluation(
     fit_kwargs = {k: v for k, v in kwargs.items() if k in fit_keys}
     eval_kwargs = {k: v for k, v in kwargs.items() if k in eval_keys}
 
+    if process_kwargs.get("scale_mode") == "global" and process_kwargs.get("flux_scale") is None:
+        reference_band = process_kwargs.get("subsample_reference_band")
+        if reference_band is None:
+            raise ValueError(
+                "MOGP scale_mode='global' with automatic scale requires "
+                "subsample_reference_band so the reduced training set is well defined."
+            )
+        if not isinstance(examples, list):
+            examples = list(islice(examples, max_examples_to_scan))
+        global_scale_process_kwargs = {
+            key: value
+            for key, value in process_kwargs.items()
+            if key not in {
+                "subsample_reference_band",
+                "preserve_peak",
+                "subtract_background",
+                "background_flux",
+                "background_estimator",
+                "background_mode",
+                "flux_scale",
+                "scale_mode",
+            }
+        }
+        global_scale = find_reduced_mogp_train_global_percentile_flux_peak(
+            examples,
+            reference_band=reference_band,
+            bands=bands,
+            percentile=kwargs.get("global_flux_percentile", 95),
+            n_objects=n_objects,
+            max_examples_to_scan=max_examples_to_scan,
+            random_state=random_state,
+            preserve_peak=process_kwargs.get("preserve_peak", True),
+            subtract_background=process_kwargs.get("subtract_background", False),
+            background_flux=process_kwargs.get("background_flux"),
+            background_estimator=process_kwargs.get("background_estimator", bitweight_location),
+            background_mode=process_kwargs.get("background_mode", "object"),
+            **global_scale_process_kwargs,
+        )
+        if global_scale is None:
+            raise ValueError("Could not compute reduced MOGP global scale from any usable object.")
+        process_kwargs["flux_scale"] = global_scale["flux_scale"]
+
     for object_idx, example in enumerate(examples):
         if len(object_results) >= n_objects or object_idx >= max_examples_to_scan:
             break
@@ -729,9 +1086,6 @@ def run_mogp_evaluation(
         )
         if train_data is None or heldout_data is None:
             continue
-        
-        print("total train:", len(train_data["y"]))
-        print("total heldout:", len(heldout_data["y"]))
 
         gp = fit_mogp_gp(
             train_data,
