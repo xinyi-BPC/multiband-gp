@@ -3,8 +3,12 @@ import numpy as np
 
 def _subset_processed_data(data, indices):
     subset = data.copy()
-    for key in ("X", "t", "y", "yerr"):
-        subset[key] = np.asarray(data[key])[indices]
+    n_obs = len(data["y"])
+    for key, value in data.items():
+        if isinstance(value, np.ndarray) and len(value) == n_obs:
+            subset[key] = value[indices]
+        elif isinstance(value, list) and len(value) == n_obs:
+            subset[key] = [value[i] for i in indices]
     return subset
 
 

@@ -6,7 +6,7 @@ def fit_basic_gp(
         data,
         kernel_type="matern",
         length_scale=0.3,
-        length_scale_bounds=(0.1, 5.0),
+        length_scale_bounds=(0.05, 5.0),
         constant_value=1.0,
         constant_value_bounds=(1e-2, 1e2),
         yerr_scale=1.0,
@@ -14,6 +14,7 @@ def fit_basic_gp(
         jitter=1e-8,
         n_restarts_optimizer=5,
         random_state=0,
+        print_kernel=True,
 ):
     X = data['X']
     y = data['y']
@@ -47,6 +48,8 @@ def fit_basic_gp(
     )
 
     gp.fit(X, y)
+    if print_kernel:
+        print(f"MOGP learned kernel: {gp.kernel_}")
     
     return gp
 

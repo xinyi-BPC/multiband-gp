@@ -11,8 +11,11 @@ from data_processing import (
     _resolve_background_and_scale,
     _split_indices,
     bitweight_location,
+    process_one_obj_one_band_train_heldout,
 )
 from singleGP_model import (
+    evaluate_heldout_metrics,
+    fit_basic_gp,
     inverse_transform_predictions,
     negative_log_predictive_density,
     summarize_object_metric_results,
@@ -27,13 +30,11 @@ DEFAULT_BAND_TO_WAVELENGTH = {
     "r": 622.3,
     "i": 754.6,
     "z": 869.1,
-    "Y": 971.0,
     0: 367.1,
     1: 482.7,
     2: 622.3,
     3: 754.6,
     4: 869.1,
-    5: 971.0,
 }
 
 
@@ -82,6 +83,7 @@ def _rng_from_seed_or_rng(random_state=None, rng=None):
 
 
 def _data_n_rows(data):
+    """Determine the number of rows in the data based on the 'band' key."""
     return len(np.asarray(data["band"]))
 
 
@@ -98,6 +100,7 @@ def _subset_rows(data, indices):
 
 
 def _append_rows(first, second):
+    """Append rows from second to first, concatenating arrays/lists of matching length."""
     first_n = _data_n_rows(first)
     merged = first.copy()
     for key, first_value in first.items():
@@ -115,6 +118,9 @@ def _append_rows(first, second):
 
 
 def _stack_raw_mogp_subset(example, bands, split_by_band, index_key):
+    """
+    Stack the raw data across bands for the given subset (train or heldout) defined by index_key.
+    """
     t_parts = []
     y_parts = []
     yerr_parts = []
@@ -123,21 +129,24 @@ def _stack_raw_mogp_subset(example, bands, split_by_band, index_key):
     row_id_parts = []
 
     for band in bands:
-        split = split_by_band[band]
+        split = split_by_band[band]  
         indices = np.asarray(split[index_key], dtype=int)
         if len(indices) == 0:
             continue
 
+        # subsampling will be done after stacking to preserve the original multiband alignment before reduction
         t_parts.append(split["t_raw"][indices])
         y_parts.append(split["y_raw"][indices])
         yerr_parts.append(split["yerr_raw"][indices])
         band_parts.append(np.full(len(indices), band, dtype=object))
         index_parts.append(indices)
+        # Create row IDs in the format "band:index" to track original rows across bands and splits
         row_id_parts.append(np.asarray([f"{band}:{idx}" for idx in indices], dtype=object))
 
     if len(t_parts) == 0:
         return None
 
+    # Stack the raw data across all bands
     t_raw = np.concatenate(t_parts)
     y_raw = np.concatenate(y_parts)
     yerr_raw = np.concatenate(yerr_parts)
@@ -174,6 +183,9 @@ def subsample_multiband_train_to_reference_band(
     If preserve_peak=True, exactly one row with the maximum raw training flux
     across all bands is forced into the reduced train set.
     """
+
+    "Count how many training observations are in the reference band. "
+    "Use that number as the target size for the reduced multiband training set."
     train_band = np.asarray(train_data["band"], dtype=object)
     n_reference_train = int(np.sum(train_band == reference_band))
     if n_reference_train <= 0:
@@ -224,6 +236,7 @@ def subsample_multiband_train_to_reference_band(
     }
     reduced_test["subsample_metadata"] = reduced_train["subsample_metadata"]
 
+    # Sanity checks to ensure the subsampling logic is correct and consistent
     if _data_n_rows(reduced_train) != n_reference_train:
         raise AssertionError("Reduced multiband train size does not match reference-band train size.")
     if preserve_peak and peak_row_id not in set(np.asarray(reduced_train.get("row_id", []), dtype=object).tolist()):
@@ -242,6 +255,7 @@ def _background_for_training_flux(
     if not subtract_background:
         return {band: 0.0 for band in train_by_band}
 
+    # If background_mode is "band", estimate a separate background_flux for each band using the provided estimator.
     if background_mode == "band":
         backgrounds = {}
         for band, arrays in train_by_band.items():
@@ -257,6 +271,7 @@ def _background_for_training_flux(
     if background_mode != "object":
         raise ValueError("background_mode must be 'object' or 'band'.")
 
+    # Estimate a single background_flux for the entire object using all training fluxes across bands.
     y_train = np.concatenate([arrays["y_raw"] for arrays in train_by_band.values()])
     if background_flux is None:
         background = float(background_estimator(y_train)[0])
@@ -265,6 +280,7 @@ def _background_for_training_flux(
     if not np.isfinite(background):
         raise ValueError("Estimated object background_flux is not finite.")
 
+    # return the same background for all bands if background_mode is "object"
     return {band: background for band in train_by_band}
 
 
@@ -369,7 +385,7 @@ def _stack_mogp_subset(
 
 def process_one_obj_mogp_train_heldout(
         example,
-        bands=("u", "g", "r", "i", "z", "Y", 0, 1, 2, 3, 4, 5),
+        bands=("u", "g", "r", "i", "z", 0, 1, 2, 3, 4),
         band_to_wavelength=None,
         flux_scale=None,
         align_peak=True,
@@ -379,8 +395,8 @@ def process_one_obj_mogp_train_heldout(
         subtract_background=False,
         background_flux=None,
         background_estimator=bitweight_location,
-        background_mode="object",
-        scale_mode=None,
+        background_mode="band",
+        scale_mode="local_peak",
         local_flux_percentile=95,
         scale_eps=1e-12,
         normalize_flux=True,
@@ -437,7 +453,7 @@ def process_one_obj_mogp_train_heldout(
 
         train_indices = train_indices[np.argsort(t_raw[train_indices])]
         heldout_indices = heldout_indices[np.argsort(t_raw[heldout_indices])]
-        split_by_band[band] = {
+        split_by_band[band] = {  
             "t_raw": t_raw,
             "y_raw": y_raw,
             "yerr_raw": yerr_raw,
@@ -458,6 +474,7 @@ def process_one_obj_mogp_train_heldout(
     if scale_mode is None:
         scale_mode = "background_scale" if subtract_background else "local_peak"
 
+    # Subsample the training and heldout data to match the reference band
     if subsample_reference_band is not None:
         raw_train_data = _stack_raw_mogp_subset(
             example,
@@ -508,6 +525,7 @@ def process_one_obj_mogp_train_heldout(
     if n_train_total < min_train_points or n_heldout_total < min_heldout_points:
         return None, None
 
+    # Estimate backgrounds for each band based on the training fluxes.
     backgrounds = _background_for_training_flux(
         train_by_band,
         subtract_background=subtract_background,
@@ -515,9 +533,8 @@ def process_one_obj_mogp_train_heldout(
         background_estimator=background_estimator,
         background_mode=background_mode,
     )
-    if len(backgrounds) > 0:
-        fallback_background = next(iter(backgrounds.values()))
-    elif background_flux is not None:
+    # Determine fallback background based on available estimates
+    if background_flux is not None:
         fallback_background = float(background_flux)
     else:
         fallback_background = 0.0
@@ -543,7 +560,7 @@ def process_one_obj_mogp_train_heldout(
         return None, None
 
     if normalize_flux:
-        if scale_mode == "global":
+        if scale_mode == "global":   # Use the provided flux_scale directly as the global scale for all bands.
             if flux_scale is None:
                 raise ValueError("scale_mode='global' requires flux_scale for MOGP.")
             resolved_flux_scale = float(flux_scale)
@@ -554,7 +571,7 @@ def process_one_obj_mogp_train_heldout(
                 subtract_background=False,
                 background_flux=None,
                 background_estimator=background_estimator,
-                scale_mode="local_peak",
+                scale_mode=scale_mode,
                 local_flux_percentile=local_flux_percentile,
                 eps=scale_eps,
             )
@@ -615,7 +632,7 @@ def process_one_obj_mogp_train_heldout(
 def find_reduced_mogp_train_global_percentile_flux_peak(
         examples,
         reference_band,
-        bands=("u", "g", "r", "i", "z", "Y", 0, 1, 2, 3, 4, 5),
+        bands=("u", "g", "r", "i", "z", 0, 1, 2, 3, 4),
         percentile=95,
         n_objects=None,
         max_examples_to_scan=3000,
@@ -672,7 +689,7 @@ def find_reduced_mogp_train_global_percentile_flux_peak(
             background_flux=background_flux,
             background_estimator=background_estimator,
             background_mode=background_mode,
-            normalize_flux=False,
+            normalize_flux=False,   # disable internal normalization to get raw flux values for percentile calculation
             scale_mode="local_peak",
             **process_kwargs,
         )
@@ -706,7 +723,7 @@ def find_reduced_mogp_train_global_percentile_flux_peak(
 def fit_mogp_gp(
         data,
         time_length_scale=0.3,
-        wavelength_length_scale=200.0,
+        wavelength_length_scale=600.0,
         time_length_scale_bounds=(0.05, 10.0),
         wavelength_length_scale_bounds=(20.0, 2000.0),
         constant_value=1.0,
@@ -910,7 +927,498 @@ def evaluate_mogp_heldout_metrics(
     }
 
 
+def _band_equal_mask(values, band):
+    values = np.asarray(values, dtype=object)
+    mask = values == band
+    mask = mask | (values.astype(str) == str(band))
+    try:
+        band_int = int(band)
+    except (TypeError, ValueError):
+        return mask
+    numeric_mask = []
+    for value in values:
+        try:
+            numeric_mask.append(int(value) == band_int)
+        except (TypeError, ValueError):
+            numeric_mask.append(False)
+    return mask | np.asarray(numeric_mask)
+
+
+def _split_raw_band_for_ablation(
+        example,
+        band,
+        heldout_fraction=0.2,
+        min_train_points=5,
+        min_heldout_points=1,
+        random_state=0,
+        strategy="random",
+        force_peak_in_train=True,
+        peak_mode="absolute",
+):
+    t_raw, y_raw, yerr_raw = _extract_valid_band_observations(example, band)
+    if len(t_raw) < min_train_points + min_heldout_points:
+        return None
+
+    force_train_indices = (
+        _find_peak_indices(y_raw, peak_mode=peak_mode)
+        if force_peak_in_train
+        else None
+    )
+    train_indices, heldout_indices = _split_indices(
+        len(t_raw),
+        heldout_fraction=heldout_fraction,
+        min_train_points=min_train_points,
+        min_heldout_points=min_heldout_points,
+        random_state=random_state,
+        strategy=strategy,
+        force_train_indices=force_train_indices,
+    )
+    train_indices = train_indices[np.argsort(t_raw[train_indices])]
+    heldout_indices = heldout_indices[np.argsort(t_raw[heldout_indices])]
+
+    return {
+        "band": band,
+        "t_raw": t_raw,
+        "y_raw": y_raw,
+        "yerr_raw": yerr_raw,
+        "train_indices": train_indices,
+        "heldout_indices": heldout_indices,
+    }
+
+
+def _raw_rows_from_split(split, indices):
+    indices = np.asarray(indices, dtype=int)
+    band = split["band"]
+    return {
+        "t_raw": split["t_raw"][indices],
+        "y_raw": split["y_raw"][indices],
+        "yerr_raw": split["yerr_raw"][indices],
+        "band": np.full(len(indices), band, dtype=object),
+        "source_indices": indices,
+        "row_id": np.asarray([f"{band}:{idx}" for idx in indices], dtype=object),
+    }
+
+
+def _concat_raw_row_groups(groups):
+    groups = [group for group in groups if group is not None and len(group["t_raw"]) > 0]
+    if len(groups) == 0:
+        return None
+
+    data = {
+        "t_raw": np.concatenate([group["t_raw"] for group in groups]),
+        "y_raw": np.concatenate([group["y_raw"] for group in groups]),
+        "yerr_raw": np.concatenate([group["yerr_raw"] for group in groups]),
+        "band": np.concatenate([group["band"] for group in groups]),
+        "source_indices": np.concatenate([group["source_indices"] for group in groups]),
+        "row_id": np.concatenate([group["row_id"] for group in groups]),
+    }
+    order = np.lexsort((data["band"].astype(str), data["t_raw"]))
+    return {key: value[order] for key, value in data.items()}
+
+
+def _sample_auxiliary_train_indices(split, ratio, rng):
+    available = np.asarray(split["train_indices"], dtype=int)
+    if ratio <= 0 or len(available) == 0:
+        return np.array([], dtype=int)
+    if ratio >= 1:
+        return available
+    n_select = int(np.floor(len(available) * ratio))
+    if n_select <= 0:
+        return np.array([], dtype=int)
+    return np.sort(rng.choice(available, size=n_select, replace=False))
+
+
+def _build_mogp_data_from_raw_rows(
+        example,
+        raw_rows,
+        reference_processed_data,
+        band_to_wavelength,
+        wavelength_override=None,
+):
+    if raw_rows is None or len(raw_rows["t_raw"]) == 0:
+        return None
+
+    band_to_wavelength = band_to_wavelength or DEFAULT_BAND_TO_WAVELENGTH
+    bands = np.asarray(raw_rows["band"], dtype=object)
+    wavelength = np.asarray([
+        wavelength_override[i]
+        if wavelength_override is not None
+        else _resolve_wavelength(band, band_to_wavelength)
+        for i, band in enumerate(bands)
+    ], dtype=float)
+
+    t_scale = float(reference_processed_data.get("t_scale", 1.0))
+    alignment_peak_time = float(reference_processed_data.get("alignment_peak_time", 0.0))
+    flux_scale = float(reference_processed_data["flux_scale"])
+    background = float(np.asarray(reference_processed_data.get("background_flux", 0.0)).reshape(-1)[0])
+    t = (np.asarray(raw_rows["t_raw"], dtype=float) - alignment_peak_time) / t_scale
+    y = (np.asarray(raw_rows["y_raw"], dtype=float) - background) / flux_scale
+    yerr = np.asarray(raw_rows["yerr_raw"], dtype=float) / flux_scale
+
+    return {
+        "X": np.column_stack([t, wavelength]),
+        "t": t,
+        "wavelength": wavelength,
+        "y": y,
+        "yerr": yerr,
+        "y_raw": np.asarray(raw_rows["y_raw"], dtype=float),
+        "yerr_raw": np.asarray(raw_rows["yerr_raw"], dtype=float),
+        "band": bands,
+        "source_indices": np.asarray(raw_rows["source_indices"], dtype=int),
+        "row_id": np.asarray(raw_rows["row_id"], dtype=object),
+        "obj_type": example["obj_type"],
+        "obj_id": example["object_id"],
+        "alignment_peak_time": alignment_peak_time,
+        "peak_alignment": reference_processed_data.get("peak_alignment", "target_peak"),
+        "flux_scale": flux_scale,
+        "scale": flux_scale,
+        "scale_mode": reference_processed_data.get("scale_mode", "target_reference"),
+        "background_flux": np.full(len(t), background, dtype=float),
+        "background_by_band": {band: background for band in np.unique(bands)},
+        "subtract_background": reference_processed_data.get("subtract_background", False),
+        "background_mode": "target_reference",
+        "t_scale": t_scale,
+    }
+
+
+def _metrics_row_from_result(model_name, metrics, train_data, target_band, heldout_indices, notes=None):
+    y_true = np.asarray(metrics["y_true"], dtype=float)
+    y_pred = np.asarray(metrics["y_pred"], dtype=float)
+    y_std = np.maximum(np.asarray(metrics["y_std"], dtype=float), 1e-12)
+    z = (y_true - y_pred) / y_std
+    train_band = np.asarray(train_data["band"], dtype=object)
+    if train_band.ndim == 0:
+        train_band = np.repeat(train_band.item(), len(train_data["y"]))
+    target_mask = _band_equal_mask(train_band, target_band)
+    coverage = metrics["coverage"]
+    return {
+        "model": model_name,
+        "object_id": metrics["object_id"][0] if len(metrics["object_id"]) else None,
+        "target_band": target_band,
+        "n_train_target_band": int(np.sum(target_mask)),
+        "n_train_other_bands": int(len(train_band) - np.sum(target_mask)),
+        "n_heldout_target_band": int(metrics["n_heldout"]),
+        "heldout_indices": np.asarray(heldout_indices, dtype=int),
+        "rmse": float(metrics["rmse"]),
+        "nlpd": float(metrics["mean_nlpd"]),
+        "coverage_1sigma": float(coverage["coverage_1sigma"]),
+        "coverage_2sigma": float(coverage["coverage_2sigma"]),
+        "coverage_3sigma": float(coverage["coverage_3sigma"]),
+        "z_score_mean": float(np.mean(z)),
+        "z_score_std": float(np.std(z)),
+        "notes": notes,
+    }
+
+
+def _evaluate_mogp_on_target_heldout(gp, target_heldout_data, train_data):
+    metrics = evaluate_mogp_heldout_metrics(
+        gp,
+        target_heldout_data,
+        train_data=train_data,
+        assert_z_invariance=True,
+    )
+    if not np.all(_band_equal_mask(metrics["band"], target_heldout_data["band"][0])):
+        raise AssertionError("MOGP evaluation contains non-target held-out rows.")
+    return metrics
+
+
+def run_target_band_ablation_study(
+        example,
+        target_band="r",
+        bands=("u", "g", "r", "i", "z", "Y", 0, 1, 2, 3, 4, 5),
+        aux_band_ratios=None,
+        shuffle_repeats=3,
+        random_state=0,
+        heldout_fraction=0.2,
+        min_train_points=5,
+        min_heldout_points=1,
+        force_peak_in_train=True,
+        peak_mode="absolute",
+        strategy="random",
+        band_to_wavelength=None,
+        include_same_total_train_budget=True,
+        single_gp_kwargs=None,
+        mogp_gp_kwargs=None,
+):
+    """
+    Run target-band ablations separating training-set size from cross-band covariance.
+
+    All models use one fixed target-band held-out split.  Models B-E evaluate
+    only those same target-band held-out points through the MOGP input format.
+    Model D is implemented as the small-wavelength-length-scale control, which
+    approximates a block-diagonal independent-band kernel for well-separated
+    band wavelengths.
+    """
+    band_to_wavelength = band_to_wavelength or DEFAULT_BAND_TO_WAVELENGTH
+    aux_band_ratios = aux_band_ratios or {}
+    single_gp_kwargs = single_gp_kwargs or {}
+    mogp_gp_kwargs = mogp_gp_kwargs or {}
+    rng = np.random.default_rng(random_state)
+
+    target_train_s, target_heldout_s = process_one_obj_one_band_train_heldout(
+        example,
+        target_band=target_band,
+        heldout_fraction=heldout_fraction,
+        min_train_points=min_train_points,
+        min_heldout_points=min_heldout_points,
+        random_state=random_state,
+        strategy=strategy,
+        force_peak_in_train=force_peak_in_train,
+        peak_mode=peak_mode,
+    )
+    if target_train_s is None or target_heldout_s is None:
+        raise ValueError(f"Could not create target-band split for {target_band!r}.")
+
+    target_split = _split_raw_band_for_ablation(
+        example,
+        target_band,
+        heldout_fraction=heldout_fraction,
+        min_train_points=min_train_points,
+        min_heldout_points=min_heldout_points,
+        random_state=random_state,
+        strategy=strategy,
+        force_peak_in_train=force_peak_in_train,
+        peak_mode=peak_mode,
+    )
+    if target_split is None:
+        raise ValueError(f"Could not recreate raw target-band split for {target_band!r}.")
+    if not np.array_equal(target_train_s["train_indices"], target_split["train_indices"]):
+        raise AssertionError("Single-GP and ablation target train indices differ.")
+    if not np.array_equal(target_heldout_s["heldout_indices"], target_split["heldout_indices"]):
+        raise AssertionError("Single-GP and ablation target held-out indices differ.")
+
+    target_train_rows = _raw_rows_from_split(target_split, target_split["train_indices"])
+    target_heldout_rows = _raw_rows_from_split(target_split, target_split["heldout_indices"])
+    target_heldout_m = _build_mogp_data_from_raw_rows(
+        example,
+        target_heldout_rows,
+        target_train_s,
+        band_to_wavelength,
+    )
+    if target_heldout_m is None:
+        raise ValueError("Could not build MOGP target held-out data.")
+    target_wavelength = _resolve_wavelength(target_band, band_to_wavelength)
+
+    aux_splits = {}
+    aux_selected_groups = []
+    aux_selected_indices_by_band = {}
+    for band in _available_bands(example, bands, band_to_wavelength):
+        if _resolve_wavelength(band, band_to_wavelength) == target_wavelength and str(band) == str(target_band):
+            continue
+        if band == target_band:
+            continue
+        ratio = float(aux_band_ratios.get(band, aux_band_ratios.get(str(band), 0.0)))
+        split = _split_raw_band_for_ablation(
+            example,
+            band,
+            heldout_fraction=heldout_fraction,
+            min_train_points=min_train_points,
+            min_heldout_points=min_heldout_points,
+            random_state=random_state,
+            strategy=strategy,
+            force_peak_in_train=force_peak_in_train,
+            peak_mode=peak_mode,
+        )
+        if split is None:
+            continue
+        aux_splits[band] = split
+        selected = _sample_auxiliary_train_indices(split, ratio, rng)
+        aux_selected_indices_by_band[band] = selected
+        aux_selected_groups.append(_raw_rows_from_split(split, selected))
+
+    real_train_rows = _concat_raw_row_groups([target_train_rows] + aux_selected_groups)
+    rows = []
+    artifacts = {}
+
+    # A. Existing single-band GP.
+    single_gp = fit_basic_gp(target_train_s, kernel_type="matern", **single_gp_kwargs)
+    single_metrics = evaluate_heldout_metrics(
+        single_gp,
+        target_heldout_s,
+        train_data=target_train_s,
+    )
+    rows.append(_metrics_row_from_result(
+        "single_band_gp",
+        single_metrics,
+        target_train_s,
+        target_band,
+        target_heldout_s["heldout_indices"],
+    ))
+    artifacts["single_band_gp"] = {
+        "gp": single_gp,
+        "train_data": target_train_s,
+        "heldout_data": target_heldout_s,
+    }
+
+    # B. MOGP target-only, fixed wavelength.
+    target_only_train_m = _build_mogp_data_from_raw_rows(
+        example,
+        target_train_rows,
+        target_train_s,
+        band_to_wavelength,
+    )
+    if target_only_train_m is None:
+        raise ValueError("Could not build MOGP target-only training data.")
+    target_only_gp = fit_mogp_gp(target_only_train_m, **mogp_gp_kwargs)
+    target_only_metrics = _evaluate_mogp_on_target_heldout(
+        target_only_gp,
+        target_heldout_m,
+        target_only_train_m,
+    )
+    rows.append(_metrics_row_from_result(
+        "mogp_target_only",
+        target_only_metrics,
+        target_only_train_m,
+        target_band,
+        target_heldout_s["heldout_indices"],
+    ))
+    artifacts["mogp_target_only"] = {
+        "gp": target_only_gp,
+        "train_data": target_only_train_m,
+        "heldout_data": target_heldout_m,
+    }
+
+    # C. Real wavelengths with selected auxiliary bands.
+    real_train_m = _build_mogp_data_from_raw_rows(
+        example,
+        real_train_rows,
+        target_train_s,
+        band_to_wavelength,
+    )
+    if real_train_m is None:
+        raise ValueError("Could not build MOGP real-wavelength training data.")
+    real_gp = fit_mogp_gp(real_train_m, **mogp_gp_kwargs)
+    real_metrics = _evaluate_mogp_on_target_heldout(real_gp, target_heldout_m, real_train_m)
+    rows.append(_metrics_row_from_result(
+        "mogp_real_wavelength",
+        real_metrics,
+        real_train_m,
+        target_band,
+        target_heldout_s["heldout_indices"],
+    ))
+    artifacts["mogp_real_wavelength"] = {
+        "gp": real_gp,
+        "train_data": real_train_m,
+        "heldout_data": target_heldout_m,
+        "aux_selected_indices_by_band": aux_selected_indices_by_band,
+    }
+
+    # D. Same points as C, approximate independent-band control.
+    independent_kwargs = dict(mogp_gp_kwargs)
+    independent_kwargs.setdefault("wavelength_length_scale", 1e-6)
+    independent_kwargs.setdefault("wavelength_length_scale_bounds", (1e-6, 1e-6))
+    independent_kwargs.setdefault("n_restarts_optimizer", 0)
+    independent_gp = fit_mogp_gp(real_train_m, **independent_kwargs)
+    independent_metrics = _evaluate_mogp_on_target_heldout(
+        independent_gp,
+        target_heldout_m,
+        real_train_m,
+    )
+    rows.append(_metrics_row_from_result(
+        "mogp_independent_band_control",
+        independent_metrics,
+        real_train_m,
+        target_band,
+        target_heldout_s["heldout_indices"],
+        notes="Approximate independent-band control: wavelength length scale set near zero.",
+    ))
+    artifacts["mogp_independent_band_control"] = {
+        "gp": independent_gp,
+        "train_data": real_train_m,
+        "heldout_data": target_heldout_m,
+    }
+
+    # E. Same points as C, shuffled non-target wavelengths.
+    shuffled_rows = []
+    non_target_mask = ~_band_equal_mask(real_train_m["band"], target_band)
+    non_target_wavelengths = np.asarray(real_train_m["wavelength"], dtype=float)[non_target_mask]
+    for repeat_idx in range(shuffle_repeats):
+        shuffled_wavelengths = np.asarray(real_train_m["wavelength"], dtype=float).copy()
+        if len(non_target_wavelengths) > 1:
+            shuffled_wavelengths[non_target_mask] = rng.permutation(non_target_wavelengths)
+        shuffled_train_m = real_train_m.copy()
+        shuffled_train_m["wavelength"] = shuffled_wavelengths
+        shuffled_train_m["X"] = np.column_stack([shuffled_train_m["t"], shuffled_wavelengths])
+        shuffled_gp = fit_mogp_gp(shuffled_train_m, **mogp_gp_kwargs)
+        shuffled_metrics = _evaluate_mogp_on_target_heldout(
+            shuffled_gp,
+            target_heldout_m,
+            shuffled_train_m,
+        )
+        shuffled_row = _metrics_row_from_result(
+            f"mogp_shuffled_wavelength_control_seed{repeat_idx}",
+            shuffled_metrics,
+            shuffled_train_m,
+            target_band,
+            target_heldout_s["heldout_indices"],
+        )
+        shuffled_row["shuffle_repeat"] = repeat_idx
+        rows.append(shuffled_row)
+        shuffled_rows.append({
+            "gp": shuffled_gp,
+            "train_data": shuffled_train_m,
+            "heldout_data": target_heldout_m,
+        })
+    artifacts["mogp_shuffled_wavelength_control"] = shuffled_rows
+
+    # F. Existing fixed-total-budget comparison: N total rows sampled from all bands.
+    if include_same_total_train_budget:
+        all_train_groups = [target_train_rows] + [
+            _raw_rows_from_split(split, split["train_indices"])
+            for split in aux_splits.values()
+        ]
+        all_train_rows = _concat_raw_row_groups(all_train_groups)
+        n_budget = len(target_train_rows["t_raw"])
+        if all_train_rows is not None and len(all_train_rows["t_raw"]) >= n_budget:
+            budget_indices = np.sort(rng.choice(np.arange(len(all_train_rows["t_raw"])), size=n_budget, replace=False))
+            budget_rows = {key: value[budget_indices] for key, value in all_train_rows.items()}
+            budget_train_m = _build_mogp_data_from_raw_rows(
+                example,
+                budget_rows,
+                target_train_s,
+                band_to_wavelength,
+            )
+            if budget_train_m is None:
+                raise ValueError("Could not build fixed-total-budget MOGP training data.")
+            budget_gp = fit_mogp_gp(budget_train_m, **mogp_gp_kwargs)
+            budget_metrics = _evaluate_mogp_on_target_heldout(
+                budget_gp,
+                target_heldout_m,
+                budget_train_m,
+            )
+            rows.append(_metrics_row_from_result(
+                "same_total_train_budget_existing",
+                budget_metrics,
+                budget_train_m,
+                target_band,
+                target_heldout_s["heldout_indices"],
+                notes="Fixed-total-budget comparison, not an isolated cross-band covariance test.",
+            ))
+            artifacts["same_total_train_budget_existing"] = {
+                "gp": budget_gp,
+                "train_data": budget_train_m,
+                "heldout_data": target_heldout_m,
+            }
+
+    expected_heldout = np.asarray(target_heldout_s["heldout_indices"], dtype=int)
+    for row in rows:
+        if not np.array_equal(np.asarray(row["heldout_indices"], dtype=int), expected_heldout):
+            raise AssertionError(f"Held-out indices differ for model {row['model']}.")
+
+    return {
+        "object_id": example["object_id"],
+        "target_band": target_band,
+        "target_heldout_indices": expected_heldout,
+        "aux_band_ratios": aux_band_ratios,
+        "rows": rows,
+        "artifacts": artifacts,
+    }
+
+
 def summarize_metrics_by_band(object_results):
+    """
+    Aggregate per-observation metrics into per-band summaries across objects.
+    """
     rows = []
     for result in object_results:
         for band in np.unique(result["band"]):
