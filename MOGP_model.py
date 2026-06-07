@@ -955,6 +955,7 @@ def _split_raw_band_for_ablation(
         force_peak_in_train=True,
         peak_mode="absolute",
 ):
+    """Split the raw observations of a single band into training and heldout sets for ablation."""
     t_raw, y_raw, yerr_raw = _extract_valid_band_observations(example, band)
     if len(t_raw) < min_train_points + min_heldout_points:
         return None
@@ -973,7 +974,7 @@ def _split_raw_band_for_ablation(
         strategy=strategy,
         force_train_indices=force_train_indices,
     )
-    train_indices = train_indices[np.argsort(t_raw[train_indices])]
+    train_indices = train_indices[np.argsort(t_raw[train_indices])] 
     heldout_indices = heldout_indices[np.argsort(t_raw[heldout_indices])]
 
     return {
@@ -987,6 +988,7 @@ def _split_raw_band_for_ablation(
 
 
 def _raw_rows_from_split(split, indices):
+    """Extract raw rows corresponding to the specified indices from a band split dict."""
     indices = np.asarray(indices, dtype=int)
     band = split["band"]
     return {
@@ -1017,6 +1019,7 @@ def _concat_raw_row_groups(groups):
 
 
 def _sample_auxiliary_train_indices(split, ratio, rng):
+    """Sample a subset of the auxiliary band train indices based on the specified ratio."""
     available = np.asarray(split["train_indices"], dtype=int)
     if ratio <= 0 or len(available) == 0:
         return np.array([], dtype=int)
@@ -1035,6 +1038,15 @@ def _build_mogp_data_from_raw_rows(
         band_to_wavelength,
         wavelength_override=None,
 ):
+    """
+    Build data dicts for MOGP training or evaluation from raw rows and reference processed data.
+    example: the original example dict for the object, used for metadata like obj_id and obj_type.
+    raw_rows: dict with keys "t_raw", "y_raw", "yerr_raw",
+                "band", "source_indices", "row_id", each containing arrays of the same length.
+    reference_processed_data: the processed data dict from the reference split, used for metadata and scaling factors.
+    band_to_wavelength: dict mapping band identifiers to wavelengths, used to compute the wavelength feature for MOGP.
+    wavelength_override: optional dict mapping band identifiers to wavelengths, used to override the band_to_wavelength mapping for specific bands.
+    """
     if raw_rows is None or len(raw_rows["t_raw"]) == 0:
         return None
 
@@ -1125,7 +1137,7 @@ def _evaluate_mogp_on_target_heldout(gp, target_heldout_data, train_data):
 def run_target_band_ablation_study(
         example,
         target_band="r",
-        bands=("u", "g", "r", "i", "z", "Y", 0, 1, 2, 3, 4, 5),
+        bands=("u", "g", "r", "i", "z", 0, 1, 2, 3, 4),
         aux_band_ratios=None,
         shuffle_repeats=3,
         random_state=0,
@@ -1155,9 +1167,11 @@ def run_target_band_ablation_study(
     mogp_gp_kwargs = mogp_gp_kwargs or {}
     rng = np.random.default_rng(random_state)
 
+    # Create the single-band GP dictionaries for the target band
     target_train_s, target_heldout_s = process_one_obj_one_band_train_heldout(
         example,
         target_band=target_band,
+        subtract_background=False,   # disable background subtraction for single-band GP to avoid confounding effects of background estimation with the ablation of auxiliary bands
         heldout_fraction=heldout_fraction,
         min_train_points=min_train_points,
         min_heldout_points=min_heldout_points,
@@ -1169,6 +1183,7 @@ def run_target_band_ablation_study(
     if target_train_s is None or target_heldout_s is None:
         raise ValueError(f"Could not create target-band split for {target_band!r}.")
 
+    # Recreate the same target-band split in raw format for MOGP
     target_split = _split_raw_band_for_ablation(
         example,
         target_band,
@@ -1182,6 +1197,7 @@ def run_target_band_ablation_study(
     )
     if target_split is None:
         raise ValueError(f"Could not recreate raw target-band split for {target_band!r}.")
+    # Assert that the MOGP ablation uses exactly the same indices as the single-band GP
     if not np.array_equal(target_train_s["train_indices"], target_split["train_indices"]):
         raise AssertionError("Single-GP and ablation target train indices differ.")
     if not np.array_equal(target_heldout_s["heldout_indices"], target_split["heldout_indices"]):
@@ -1189,6 +1205,7 @@ def run_target_band_ablation_study(
 
     target_train_rows = _raw_rows_from_split(target_split, target_split["train_indices"])
     target_heldout_rows = _raw_rows_from_split(target_split, target_split["heldout_indices"])
+    # Convert the same target-band held-out rows to MOGP format for evaluation of B\C\D\E\F models on the same target-band held-out points
     target_heldout_m = _build_mogp_data_from_raw_rows(
         example,
         target_heldout_rows,
@@ -1202,6 +1219,7 @@ def run_target_band_ablation_study(
     aux_splits = {}
     aux_selected_groups = []
     aux_selected_indices_by_band = {}
+    # Iterate over all available bands except the target band to create auxiliary training splits and select points based on the specified ratios.
     for band in _available_bands(example, bands, band_to_wavelength):
         if _resolve_wavelength(band, band_to_wavelength) == target_wavelength and str(band) == str(target_band):
             continue

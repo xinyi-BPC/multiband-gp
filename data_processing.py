@@ -41,12 +41,14 @@ def _split_indices(
             "Not enough non-forced observations to make the requested held-out split: "
             f"{len(candidate_heldout_indices)} available, {min_heldout_points} required."
         )
-
+    
+    # Compute the number of held-out points based on the fraction, while respecting the minimums and maximums.
     n_heldout = int(np.ceil(n_obs * heldout_fraction))
     n_heldout = max(min_heldout_points, n_heldout)
     n_heldout = min(n_heldout, n_obs - min_train_points)
     n_heldout = min(n_heldout, len(candidate_heldout_indices))
 
+    # Randomly sample held-out indices from the candidates, ensuring that forced train indices are not included.
     if strategy == "random":
         rng = np.random.default_rng(random_state)
         heldout_indices = np.sort(
