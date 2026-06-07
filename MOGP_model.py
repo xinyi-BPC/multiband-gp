@@ -1,7 +1,10 @@
 from itertools import islice
+from pathlib import Path
 from typing import Any, cast
+import warnings
 
 import numpy as np
+import pandas as pd
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern
 
@@ -1649,3 +1652,411 @@ def run_mogp_evaluation(
         "scanned_examples": scanned,
         "bands": bands,
     }
+
+
+def _canonical_ablation_model_name(model):
+    model = str(model)
+    if model.startswith("mogp_shuffled_wavelength_control_seed"):
+        return "mogp_shuffled_wavelength_control"
+    return model
+
+
+def collapse_shuffled_wavelength_controls(
+        results_df,
+        keep_seed_level=False,
+):
+    """
+    Collapse shuffled wavelength seed rows to one object-band row per model.
+
+    C vs shuffled controls tests whether real wavelength structure matters
+    beyond generic cross-band information sharing.  Collapsing prevents one
+    object with many shuffle seeds from being overrepresented in aggregates.
+    """
+    df = results_df.copy()
+    if "model" not in df.columns:
+        raise ValueError("results_df must contain a 'model' column.")
+
+    df["model_original"] = df["model"]
+    df["model"] = df["model"].map(_canonical_ablation_model_name)
+    if keep_seed_level:
+        return df
+
+    group_cols = ["model", "object_id", "target_band"]
+    missing = [col for col in group_cols if col not in df.columns]
+    if missing:
+        raise ValueError(f"results_df missing required columns for shuffled collapse: {missing}")
+
+    numeric_cols = [
+        col for col in df.select_dtypes(include=[np.number]).columns
+        if col not in {"shuffle_repeat"}
+    ]
+    first_cols = [
+        col for col in df.columns
+        if col not in set(group_cols + numeric_cols)
+    ]
+    agg_spec = {col: "mean" for col in numeric_cols}
+    agg_spec.update({col: "first" for col in first_cols})
+
+    collapsed = df.groupby(group_cols, as_index=False, dropna=False).agg(agg_spec)
+    return collapsed
+
+
+def _prepare_ablation_results_df(
+        results_df,
+        collapse_shuffled=True,
+        keep_seed_level=False,
+):
+    df = results_df.copy()
+    required = {
+        "model",
+        "object_id",
+        "target_band",
+        "n_heldout_target_band",
+        "rmse",
+        "nlpd",
+        "coverage_1sigma",
+        "coverage_2sigma",
+        "coverage_3sigma",
+        "z_score_mean",
+        "z_score_std",
+    }
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"results_df is missing required columns: {missing}")
+
+    df = df[pd.to_numeric(df["n_heldout_target_band"], errors="coerce") > 0].copy()
+    if len(df) == 0:
+        raise ValueError("No rows remain after excluding n_heldout_target_band <= 0.")
+
+    if collapse_shuffled:
+        df = collapse_shuffled_wavelength_controls(df, keep_seed_level=keep_seed_level)
+
+    return df
+
+
+def _standard_error(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) <= 1:
+        return np.nan
+    return float(np.std(values, ddof=1) / np.sqrt(len(values)))
+
+
+def _weighted_mean(values, weights):
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    valid = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+    if not np.any(valid):
+        return np.nan
+    return float(np.sum(weights[valid] * values[valid]) / np.sum(weights[valid]))
+
+
+def _aggregate_residual_level_if_available(group):
+    """
+    Prefer residual-level arrays for z/RMSE when the dataframe carries them.
+    Expected optional columns are y_true/y_pred and/or z_scores.
+    """
+    y_true_values = []
+    y_pred_values = []
+    z_values = []
+    if {"y_true", "y_pred"}.issubset(group.columns):
+        for _, row in group.iterrows():
+            y_true = row.get("y_true")
+            y_pred = row.get("y_pred")
+            if y_true is not None and y_pred is not None:
+                y_true_values.append(np.asarray(y_true, dtype=float).reshape(-1))
+                y_pred_values.append(np.asarray(y_pred, dtype=float).reshape(-1))
+    if "z_scores" in group.columns:
+        for _, row in group.iterrows():
+            z = row.get("z_scores")
+            if z is not None:
+                z_values.append(np.asarray(z, dtype=float).reshape(-1))
+
+    out = {}
+    if len(y_true_values) > 0:
+        y_true_all = np.concatenate(y_true_values)
+        y_pred_all = np.concatenate(y_pred_values)
+        out["rmse_obs_weighted"] = float(np.sqrt(np.mean((y_true_all - y_pred_all) ** 2)))
+    if len(z_values) > 0:
+        z_all = np.concatenate(z_values)
+        out["z_score_mean_obs_weighted"] = float(np.mean(z_all))
+        out["z_score_std_obs_weighted"] = float(np.std(z_all))
+    return out
+
+
+def aggregate_gp_ablation_results(
+        results_df,
+        group_cols=None,
+        residual_level_available=False,
+        collapse_shuffled=True,
+        keep_seed_level=False,
+        min_cases_warn=5,
+):
+    """
+    Aggregate GP ablation rows using observation- and object-weighted summaries.
+
+    Observation-weighted metrics describe performance over all held-out
+    observations.  Object-weighted metrics describe performance for a typical
+    object-band case and prevent high-cadence objects from dominating.
+    """
+    if group_cols is None:
+        group_cols = ["model"]
+    df = _prepare_ablation_results_df(
+        results_df,
+        collapse_shuffled=collapse_shuffled,
+        keep_seed_level=keep_seed_level,
+    )
+
+    rows = []
+    for group_key, group in df.groupby(group_cols, dropna=False):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+        row = {col: value for col, value in zip(group_cols, group_key)}
+
+        n = group["n_heldout_target_band"].astype(float).to_numpy()
+        row["n_object_band_cases"] = int(len(group))
+        row["n_unique_objects"] = int(group["object_id"].nunique())
+        row["n_total_heldout"] = int(np.sum(n))
+
+        if row["n_object_band_cases"] < min_cases_warn:
+            warnings.warn(
+                f"Group {row} has only {row['n_object_band_cases']} object-band cases; "
+                "do not treat this as global evidence.",
+                RuntimeWarning,
+            )
+
+        row["rmse_obs_weighted"] = float(
+            np.sqrt(np.sum(n * group["rmse"].astype(float).to_numpy() ** 2) / np.sum(n))
+        )
+        row["nlpd_obs_weighted"] = _weighted_mean(group["nlpd"], n)
+        for cov in ("coverage_1sigma", "coverage_2sigma", "coverage_3sigma"):
+            row[f"{cov}_obs_weighted"] = _weighted_mean(group[cov], n)
+
+        z_mean_obs = _weighted_mean(group["z_score_mean"], n)
+        z_second = _weighted_mean(
+            group["z_score_std"].astype(float) ** 2 + group["z_score_mean"].astype(float) ** 2,
+            n,
+        )
+        row["z_score_mean_obs_weighted"] = z_mean_obs
+        row["z_score_std_obs_weighted"] = float(
+            np.sqrt(max(z_second - z_mean_obs ** 2, 0.0))
+        )
+
+        if residual_level_available:
+            row.update(_aggregate_residual_level_if_available(group))
+
+        object_metrics = {
+            "rmse": "rmse_object_weighted",
+            "nlpd": "nlpd_object_weighted",
+            "coverage_1sigma": "coverage_1sigma_object_weighted",
+            "coverage_2sigma": "coverage_2sigma_object_weighted",
+            "coverage_3sigma": "coverage_3sigma_object_weighted",
+            "z_score_mean": "z_score_mean_object_weighted",
+            "z_score_std": "z_score_std_object_weighted",
+        }
+        for src, dest in object_metrics.items():
+            values = group[src].astype(float).to_numpy()
+            row[dest] = float(np.mean(values))
+            row[f"{src}_object_std"] = float(np.std(values, ddof=1)) if len(values) > 1 else np.nan
+            row[f"{src}_object_se"] = _standard_error(values)
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def compare_models_aggregated(
+        results_df,
+        model_pairs=None,
+        collapse_shuffled=True,
+        keep_seed_level=False,
+):
+    """
+    Paired model comparisons matched exactly by object_id and target_band.
+
+    C vs D, mogp_real_wavelength vs mogp_independent_band_control, is the key
+    comparison for whether cross-band covariance helps beyond merely adding
+    more data points.  A/B matching is a preprocessing sanity check.
+    """
+    if model_pairs is None:
+        model_pairs = [
+            ("mogp_real_wavelength", "single_band_gp"),
+            ("mogp_real_wavelength", "mogp_independent_band_control"),
+            ("mogp_real_wavelength", "mogp_shuffled_wavelength_control"),
+            ("same_total_train_budget_existing", "single_band_gp"),
+            ("mogp_target_only", "single_band_gp"),
+        ]
+    df = _prepare_ablation_results_df(
+        results_df,
+        collapse_shuffled=collapse_shuffled,
+        keep_seed_level=keep_seed_level,
+    )
+
+    out_rows = []
+    for model_a, model_b in model_pairs:
+        a = df[df["model"] == model_a].copy()
+        b = df[df["model"] == model_b].copy()
+        paired = a.merge(
+            b,
+            on=["object_id", "target_band"],
+            suffixes=("_a", "_b"),
+            how="inner",
+        )
+        if len(paired) == 0:
+            warnings.warn(
+                f"No matched object-band pairs for {model_a} vs {model_b}.",
+                RuntimeWarning,
+            )
+            continue
+
+        delta_rmse = paired["rmse_a"].astype(float) - paired["rmse_b"].astype(float)
+        delta_nlpd = paired["nlpd_a"].astype(float) - paired["nlpd_b"].astype(float)
+        delta_cov1 = paired["coverage_1sigma_a"].astype(float) - paired["coverage_1sigma_b"].astype(float)
+        delta_z_std = paired["z_score_std_a"].astype(float) - paired["z_score_std_b"].astype(float)
+        better_z = (
+            np.abs(paired["z_score_std_a"].astype(float) - 1.0)
+            < np.abs(paired["z_score_std_b"].astype(float) - 1.0)
+        )
+
+        row = {
+            "model_a": model_a,
+            "model_b": model_b,
+            "n_matched_object_band_pairs": int(len(paired)),
+            "delta_rmse_mean": float(np.mean(delta_rmse)),
+            "delta_rmse_median": float(np.median(delta_rmse)),
+            "delta_rmse_se": _standard_error(delta_rmse),
+            "delta_nlpd_mean": float(np.mean(delta_nlpd)),
+            "delta_nlpd_median": float(np.median(delta_nlpd)),
+            "delta_nlpd_se": _standard_error(delta_nlpd),
+            "delta_coverage_1sigma_mean": float(np.mean(delta_cov1)),
+            "delta_coverage_1sigma_median": float(np.median(delta_cov1)),
+            "delta_coverage_1sigma_se": _standard_error(delta_cov1),
+            "delta_z_score_std_mean": float(np.mean(delta_z_std)),
+            "delta_z_score_std_median": float(np.median(delta_z_std)),
+            "delta_z_score_std_se": _standard_error(delta_z_std),
+            "fraction_improved_rmse": float(np.mean(delta_rmse < 0)),
+            "fraction_improved_nlpd": float(np.mean(delta_nlpd < 0)),
+            "fraction_better_calibrated_z_std": float(np.mean(better_z)),
+        }
+        out_rows.append(row)
+
+    return pd.DataFrame(out_rows)
+
+
+def save_gp_ablation_reports(
+        results_df,
+        output_dir=".",
+        collapse_shuffled=True,
+        keep_seed_level=False,
+):
+    """
+    Save standard ablation aggregate CSV reports.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    by_model = aggregate_gp_ablation_results(
+        results_df,
+        group_cols=["model"],
+        collapse_shuffled=collapse_shuffled,
+        keep_seed_level=keep_seed_level,
+    )
+    by_model_band = aggregate_gp_ablation_results(
+        results_df,
+        group_cols=["model", "target_band"],
+        collapse_shuffled=collapse_shuffled,
+        keep_seed_level=keep_seed_level,
+    )
+    comparisons = compare_models_aggregated(
+        results_df,
+        collapse_shuffled=collapse_shuffled,
+        keep_seed_level=keep_seed_level,
+    )
+
+    paths = {
+        "by_model": output_dir / "gp_ablation_aggregated_by_model.csv",
+        "by_model_and_band": output_dir / "gp_ablation_aggregated_by_model_and_band.csv",
+        "paired_model_comparisons": output_dir / "gp_ablation_paired_model_comparisons.csv",
+    }
+    by_model.to_csv(paths["by_model"], index=False)
+    by_model_band.to_csv(paths["by_model_and_band"], index=False)
+    comparisons.to_csv(paths["paired_model_comparisons"], index=False)
+
+    return {
+        "aggregated_by_model": by_model,
+        "aggregated_by_model_and_band": by_model_band,
+        "paired_model_comparisons": comparisons,
+        "paths": paths,
+    }
+
+
+def plot_gp_ablation_summary(
+        results_df,
+        output_dir=None,
+        collapse_shuffled=True,
+):
+    """
+    Create optional summary plots for ablation aggregates.
+    """
+    import matplotlib.pyplot as plt
+
+    output_dir = None if output_dir is None else Path(output_dir)
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    agg = aggregate_gp_ablation_results(
+        results_df,
+        group_cols=["model"],
+        collapse_shuffled=collapse_shuffled,
+    )
+    prepared = _prepare_ablation_results_df(results_df, collapse_shuffled=collapse_shuffled)
+
+    figures = {}
+    for metric, title, filename in [
+        ("nlpd_obs_weighted", "Observation-weighted NLPD by model", "nlpd_observation_weighted_by_model.png"),
+        ("nlpd_object_weighted", "Object-weighted NLPD by model", "nlpd_object_weighted_by_model.png"),
+    ]:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ordered = agg.sort_values(metric)
+        ax.bar(ordered["model"], ordered[metric])
+        ax.set_ylabel(metric)
+        ax.set_title(title)
+        ax.tick_params(axis="x", rotation=45)
+        fig.tight_layout()
+        if output_dir is not None:
+            fig.savefig(output_dir / filename, bbox_inches="tight")
+        figures[metric] = fig
+
+    paired = prepared.pivot_table(
+        index=["object_id", "target_band"],
+        columns="model",
+        values="nlpd",
+        aggfunc="mean",
+    )
+    if {"mogp_real_wavelength", "mogp_independent_band_control"}.issubset(paired.columns):
+        delta = paired["mogp_real_wavelength"] - paired["mogp_independent_band_control"]
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.hist(delta.dropna(), bins=20, alpha=0.8)
+        ax.axvline(0, color="black", linestyle="--", linewidth=1)
+        ax.set_title("Paired delta NLPD: real wavelength - independent-band control")
+        ax.set_xlabel("Delta NLPD")
+        ax.set_ylabel("Object-band count")
+        fig.tight_layout()
+        if output_dir is not None:
+            fig.savefig(output_dir / "delta_nlpd_real_vs_independent.png", bbox_inches="tight")
+        figures["delta_nlpd_real_vs_independent"] = fig
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ordered = agg.sort_values("z_score_std_object_weighted")
+    ax.bar(ordered["model"], ordered["z_score_std_object_weighted"])
+    ax.axhline(1.0, color="black", linestyle="--", linewidth=1, label="ideal")
+    ax.set_ylabel("Object-weighted z-score std")
+    ax.set_title("z-score std by model")
+    ax.tick_params(axis="x", rotation=45)
+    ax.legend()
+    fig.tight_layout()
+    if output_dir is not None:
+        fig.savefig(output_dir / "z_score_std_by_model.png", bbox_inches="tight")
+    figures["z_score_std_by_model"] = fig
+
+    return figures
