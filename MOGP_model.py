@@ -5,6 +5,7 @@ import warnings
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, Matern
 
@@ -21,6 +22,7 @@ from singleGP_model import (
     fit_basic_gp,
     inverse_transform_predictions,
     negative_log_predictive_density,
+    object_level_empirical_flux_scale,
     summarize_object_metric_results,
 )
 
@@ -736,7 +738,7 @@ def fit_mogp_gp(
         jitter=1e-8,
         n_restarts_optimizer=2,
         random_state=0,
-        print_kernel=True,
+        print_kernel=False,
 ):
     """Fit the minimal continuous time+wavelength GP baseline."""
     kernel = ConstantKernel(
@@ -804,6 +806,10 @@ def evaluate_mogp_heldout_metrics(
         gp,
         heldout_data,
         train_data=None,
+        object_data=None,
+        object_flux_scale=None,
+        nrmse_quantile=0.95,
+        nrmse_epsilon=1e-8,
         coverage_sigmas=(1.0, 2.0, 3.0),
         include_yerr=True,
         yerr_scale=1.0,
@@ -865,6 +871,16 @@ def evaluate_mogp_heldout_metrics(
         metric_space = "normalized"
 
     squared_errors = (y_metric - mean_metric) ** 2
+    rmse = float(np.sqrt(np.mean(squared_errors)))
+    if object_flux_scale is None:
+        object_flux_scale = object_level_empirical_flux_scale(
+            train_data,
+            heldout_data,
+            example=object_data,
+            q=nrmse_quantile,
+            epsilon=nrmse_epsilon,
+        )
+    object_flux_scale = float(max(float(object_flux_scale), nrmse_epsilon))
     per_point_nlpd = negative_log_predictive_density(y_metric, mean_metric, variance_metric)
 
     n_heldout = len(y_metric)
@@ -899,8 +915,11 @@ def evaluate_mogp_heldout_metrics(
         "metric_space": metric_space,
         "mean_nlpd": float(np.mean(per_point_nlpd)),
         "total_nlpd": float(np.sum(per_point_nlpd)),
-        "rmse": float(np.sqrt(np.mean(squared_errors))),
+        "rmse": rmse,
+        "nrmse": float(rmse / object_flux_scale),
         "sse": float(np.sum(squared_errors)),
+        "object_flux_scale": object_flux_scale,
+        "nrmse_quantile": float(nrmse_quantile),
         "coverage": coverage,
         "coverage_counts": coverage_counts,
         "per_point_nlpd": per_point_nlpd,
@@ -1101,6 +1120,7 @@ def _metrics_row_from_result(model_name, metrics, train_data, target_band, heldo
     y_pred = np.asarray(metrics["y_pred"], dtype=float)
     y_std = np.maximum(np.asarray(metrics["y_std"], dtype=float), 1e-12)
     z = (y_true - y_pred) / y_std
+    pit = norm.cdf(z)
     train_band = np.asarray(train_data["band"], dtype=object)
     if train_band.ndim == 0:
         train_band = np.repeat(train_band.item(), len(train_data["y"]))
@@ -1115,21 +1135,36 @@ def _metrics_row_from_result(model_name, metrics, train_data, target_band, heldo
         "n_heldout_target_band": int(metrics["n_heldout"]),
         "heldout_indices": np.asarray(heldout_indices, dtype=int),
         "rmse": float(metrics["rmse"]),
+        "nrmse": float(metrics["nrmse"]),
+        "object_flux_scale": float(metrics["object_flux_scale"]),
         "nlpd": float(metrics["mean_nlpd"]),
         "coverage_1sigma": float(coverage["coverage_1sigma"]),
         "coverage_2sigma": float(coverage["coverage_2sigma"]),
         "coverage_3sigma": float(coverage["coverage_3sigma"]),
         "z_score_mean": float(np.mean(z)),
         "z_score_std": float(np.std(z)),
+        "pit": pit,
         "notes": notes,
     }
 
 
-def _evaluate_mogp_on_target_heldout(gp, target_heldout_data, train_data):
+def _evaluate_mogp_on_target_heldout(
+        gp,
+        target_heldout_data,
+        train_data,
+        object_data=None,
+        object_flux_scale=None,
+        nrmse_quantile=0.95,
+        nrmse_epsilon=1e-8,
+):
     metrics = evaluate_mogp_heldout_metrics(
         gp,
         target_heldout_data,
         train_data=train_data,
+        object_data=object_data,
+        object_flux_scale=object_flux_scale,
+        nrmse_quantile=nrmse_quantile,
+        nrmse_epsilon=nrmse_epsilon,
         assert_z_invariance=True,
     )
     if not np.all(_band_equal_mask(metrics["band"], target_heldout_data["band"][0])):
@@ -1152,6 +1187,8 @@ def run_target_band_ablation_study(
         strategy="random",
         band_to_wavelength=None,
         include_same_total_train_budget=True,
+        nrmse_quantile=0.95,
+        nrmse_epsilon=1e-8,
         single_gp_kwargs=None,
         mogp_gp_kwargs=None,
 ):
@@ -1169,6 +1206,11 @@ def run_target_band_ablation_study(
     single_gp_kwargs = single_gp_kwargs or {}
     mogp_gp_kwargs = mogp_gp_kwargs or {}
     rng = np.random.default_rng(random_state)
+    object_flux_scale = object_level_empirical_flux_scale(
+        example=example,
+        q=nrmse_quantile,
+        epsilon=nrmse_epsilon,
+    )
 
     # Create the single-band GP dictionaries for the target band
     target_train_s, target_heldout_s = process_one_obj_one_band_train_heldout(
@@ -1257,6 +1299,10 @@ def run_target_band_ablation_study(
         single_gp,
         target_heldout_s,
         train_data=target_train_s,
+        object_data=example,
+        object_flux_scale=object_flux_scale,
+        nrmse_quantile=nrmse_quantile,
+        nrmse_epsilon=nrmse_epsilon,
     )
     rows.append(_metrics_row_from_result(
         "single_band_gp",
@@ -1285,6 +1331,10 @@ def run_target_band_ablation_study(
         target_only_gp,
         target_heldout_m,
         target_only_train_m,
+        object_data=example,
+        object_flux_scale=object_flux_scale,
+        nrmse_quantile=nrmse_quantile,
+        nrmse_epsilon=nrmse_epsilon,
     )
     rows.append(_metrics_row_from_result(
         "mogp_target_only",
@@ -1309,7 +1359,15 @@ def run_target_band_ablation_study(
     if real_train_m is None:
         raise ValueError("Could not build MOGP real-wavelength training data.")
     real_gp = fit_mogp_gp(real_train_m, **mogp_gp_kwargs)
-    real_metrics = _evaluate_mogp_on_target_heldout(real_gp, target_heldout_m, real_train_m)
+    real_metrics = _evaluate_mogp_on_target_heldout(
+        real_gp,
+        target_heldout_m,
+        real_train_m,
+        object_data=example,
+        object_flux_scale=object_flux_scale,
+        nrmse_quantile=nrmse_quantile,
+        nrmse_epsilon=nrmse_epsilon,
+    )
     rows.append(_metrics_row_from_result(
         "mogp_real_wavelength",
         real_metrics,
@@ -1334,6 +1392,10 @@ def run_target_band_ablation_study(
         independent_gp,
         target_heldout_m,
         real_train_m,
+        object_data=example,
+        object_flux_scale=object_flux_scale,
+        nrmse_quantile=nrmse_quantile,
+        nrmse_epsilon=nrmse_epsilon,
     )
     rows.append(_metrics_row_from_result(
         "mogp_independent_band_control",
@@ -1365,6 +1427,10 @@ def run_target_band_ablation_study(
             shuffled_gp,
             target_heldout_m,
             shuffled_train_m,
+            object_data=example,
+            object_flux_scale=object_flux_scale,
+            nrmse_quantile=nrmse_quantile,
+            nrmse_epsilon=nrmse_epsilon,
         )
         shuffled_row = _metrics_row_from_result(
             f"mogp_shuffled_wavelength_control_seed{repeat_idx}",
@@ -1406,6 +1472,10 @@ def run_target_band_ablation_study(
                 budget_gp,
                 target_heldout_m,
                 budget_train_m,
+                object_data=example,
+                object_flux_scale=object_flux_scale,
+                nrmse_quantile=nrmse_quantile,
+                nrmse_epsilon=nrmse_epsilon,
             )
             rows.append(_metrics_row_from_result(
                 "same_total_train_budget_existing",
@@ -1454,6 +1524,7 @@ def summarize_metrics_by_band(object_results):
                 "n_heldout": int(np.sum(mask)),
                 "total_nlpd": float(np.sum(per_point_nlpd)),
                 "sse": float(np.sum((y - pred) ** 2)),
+                "object_flux_scale": float(result.get("object_flux_scale", np.nan)),
                 "coverage_1sigma_count": int(np.sum(np.abs(z) <= 1)),
                 "coverage_2sigma_count": int(np.sum(np.abs(z) <= 2)),
                 "coverage_3sigma_count": int(np.sum(np.abs(z) <= 3)),
@@ -1463,10 +1534,16 @@ def summarize_metrics_by_band(object_results):
     for band in sorted({row["band"] for row in rows}, key=str):
         band_rows = [row for row in rows if row["band"] == band]
         n = sum(row["n_heldout"] for row in band_rows)
+        band_nrmse_values = [
+            np.sqrt(row["sse"] / row["n_heldout"]) / max(row["object_flux_scale"], 1e-8)
+            for row in band_rows
+            if np.isfinite(row["object_flux_scale"])
+        ]
         summary[band] = {
             "n_heldout": int(n),
             "nlpd": float(sum(row["total_nlpd"] for row in band_rows) / n),
             "rmse": float(np.sqrt(sum(row["sse"] for row in band_rows) / n)),
+            "nrmse": float(np.mean(band_nrmse_values)) if band_nrmse_values else np.nan,
             "coverage_1sigma": float(sum(row["coverage_1sigma_count"] for row in band_rows) / n),
             "coverage_2sigma": float(sum(row["coverage_2sigma_count"] for row in band_rows) / n),
             "coverage_3sigma": float(sum(row["coverage_3sigma_count"] for row in band_rows) / n),
@@ -1554,7 +1631,14 @@ def run_mogp_evaluation(
         "jitter",
         "n_restarts_optimizer",
     }
-    eval_keys = {"include_yerr", "yerr_scale", "noise_floor", "evaluate_raw_metrics"}
+    eval_keys = {
+        "include_yerr",
+        "yerr_scale",
+        "noise_floor",
+        "evaluate_raw_metrics",
+        "nrmse_quantile",
+        "nrmse_epsilon",
+    }
 
     process_kwargs = {k: v for k, v in kwargs.items() if k in process_keys}
     fit_kwargs = {k: v for k, v in kwargs.items() if k in fit_keys}
@@ -1626,6 +1710,7 @@ def run_mogp_evaluation(
             gp,
             heldout_data,
             train_data=train_data,
+            object_data=example,
             **eval_kwargs,
         )
         object_results.append(metrics)
@@ -1713,6 +1798,7 @@ def _prepare_ablation_results_df(
         "target_band",
         "n_heldout_target_band",
         "rmse",
+        "nrmse",
         "nlpd",
         "coverage_1sigma",
         "coverage_2sigma",
@@ -1828,6 +1914,9 @@ def aggregate_gp_ablation_results(
         row["rmse_obs_weighted"] = float(
             np.sqrt(np.sum(n * group["rmse"].astype(float).to_numpy() ** 2) / np.sum(n))
         )
+        row["nrmse_obs_weighted"] = float(
+            np.sqrt(np.sum(n * group["nrmse"].astype(float).to_numpy() ** 2) / np.sum(n))
+        )
         row["nlpd_obs_weighted"] = _weighted_mean(group["nlpd"], n)
         for cov in ("coverage_1sigma", "coverage_2sigma", "coverage_3sigma"):
             row[f"{cov}_obs_weighted"] = _weighted_mean(group[cov], n)
@@ -1847,6 +1936,7 @@ def aggregate_gp_ablation_results(
 
         object_metrics = {
             "rmse": "rmse_object_weighted",
+            "nrmse": "nrmse_object_weighted",
             "nlpd": "nlpd_object_weighted",
             "coverage_1sigma": "coverage_1sigma_object_weighted",
             "coverage_2sigma": "coverage_2sigma_object_weighted",
@@ -1857,6 +1947,7 @@ def aggregate_gp_ablation_results(
         for src, dest in object_metrics.items():
             values = group[src].astype(float).to_numpy()
             row[dest] = float(np.mean(values))
+            # compute object-weighted standard deviation and standard error for the metric
             row[f"{src}_object_std"] = float(np.std(values, ddof=1)) if len(values) > 1 else np.nan
             row[f"{src}_object_se"] = _standard_error(values)
 
@@ -1910,6 +2001,7 @@ def compare_models_aggregated(
             continue
 
         delta_rmse = paired["rmse_a"].astype(float) - paired["rmse_b"].astype(float)
+        delta_nrmse = paired["nrmse_a"].astype(float) - paired["nrmse_b"].astype(float)
         delta_nlpd = paired["nlpd_a"].astype(float) - paired["nlpd_b"].astype(float)
         delta_cov1 = paired["coverage_1sigma_a"].astype(float) - paired["coverage_1sigma_b"].astype(float)
         delta_z_std = paired["z_score_std_a"].astype(float) - paired["z_score_std_b"].astype(float)
@@ -1925,6 +2017,9 @@ def compare_models_aggregated(
             "delta_rmse_mean": float(np.mean(delta_rmse)),
             "delta_rmse_median": float(np.median(delta_rmse)),
             "delta_rmse_se": _standard_error(delta_rmse),
+            "delta_nrmse_mean": float(np.mean(delta_nrmse)),
+            "delta_nrmse_median": float(np.median(delta_nrmse)),
+            "delta_nrmse_se": _standard_error(delta_nrmse),
             "delta_nlpd_mean": float(np.mean(delta_nlpd)),
             "delta_nlpd_median": float(np.median(delta_nlpd)),
             "delta_nlpd_se": _standard_error(delta_nlpd),
@@ -1935,6 +2030,7 @@ def compare_models_aggregated(
             "delta_z_score_std_median": float(np.median(delta_z_std)),
             "delta_z_score_std_se": _standard_error(delta_z_std),
             "fraction_improved_rmse": float(np.mean(delta_rmse < 0)),
+            "fraction_improved_nrmse": float(np.mean(delta_nrmse < 0)),
             "fraction_improved_nlpd": float(np.mean(delta_nlpd < 0)),
             "fraction_better_calibrated_z_std": float(np.mean(better_z)),
         }
@@ -2015,6 +2111,8 @@ def plot_gp_ablation_summary(
     for metric, title, filename in [
         ("nlpd_obs_weighted", "Observation-weighted NLPD by model", "nlpd_observation_weighted_by_model.png"),
         ("nlpd_object_weighted", "Object-weighted NLPD by model", "nlpd_object_weighted_by_model.png"),
+        ("nrmse_obs_weighted", "Observation-weighted NRMSE by model", "nrmse_observation_weighted_by_model.png"),
+        ("nrmse_object_weighted", "Object-weighted NRMSE by model", "nrmse_object_weighted_by_model.png"),
     ]:
         fig, ax = plt.subplots(figsize=(10, 5))
         ordered = agg.sort_values(metric)
