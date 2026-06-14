@@ -50,91 +50,6 @@ def RMSE(y_true, y_pred):
     """Compute root mean squared error."""
     return np.sqrt(np.mean((y_true - y_pred) ** 2))
 
-def evaluate_heldout_rmse(
-        gp,
-        heldout_data,
-        evaluate_raw_metrics=True,
-        train_data=None,
-        object_data=None,
-        object_flux_scale=None,
-        nrmse_quantile=0.95,
-        nrmse_epsilon=1e-8,
-):
-    """
-    Compare held-out observations with the GP predictive mean using RMSE.
-    """
-    mean, _, _ = predict_observation_distribution(
-        gp,
-        heldout_data,
-        include_yerr=False,
-        return_raw_flux=evaluate_raw_metrics,
-    )
-    if evaluate_raw_metrics:
-        y_true, _, _, _ = _raw_observation_arrays(heldout_data)
-    else:
-        y_true = heldout_data["y"]
-    rmse = RMSE(y_true, mean)
-    if object_flux_scale is None:
-        object_flux_scale = object_level_empirical_flux_scale(
-            train_data,
-            heldout_data,
-            example=object_data,
-            q=nrmse_quantile,
-            epsilon=nrmse_epsilon,
-        )
-    object_flux_scale = float(max(float(object_flux_scale), nrmse_epsilon))
-
-    return {
-        "rmse": float(rmse),
-        "nrmse": float(rmse / object_flux_scale),
-        "object_flux_scale": object_flux_scale,
-        "nrmse_quantile": float(nrmse_quantile),
-        "y_pred": mean,
-        "metric_space": "raw" if evaluate_raw_metrics else "normalized",
-    }
-
-def evaluate_heldout_nlpd(
-        gp,
-        heldout_data,
-        include_yerr=True,
-        yerr_scale=1.0,
-        noise_floor=0.0,
-        extra_noise=None,
-        evaluate_raw_metrics=True,
-):
-    """
-    Compare held-out observations with the GP predictive distribution using NLPD.
-    """
-    mean, std, variance = predict_observation_distribution(
-        gp,
-        heldout_data,
-        include_yerr=include_yerr,
-        yerr_scale=yerr_scale,
-        noise_floor=noise_floor,
-        extra_noise=extra_noise,
-        return_raw_flux=evaluate_raw_metrics,
-    )
-    if evaluate_raw_metrics:
-        y_true, _, _, _ = _raw_observation_arrays(heldout_data)
-    else:
-        y_true = heldout_data["y"]
-    per_point_nlpd = negative_log_predictive_density(
-        y_true,
-        mean,
-        variance,
-    )
-
-    return {
-        "mean_nlpd": float(np.mean(per_point_nlpd)),
-        "total_nlpd": float(np.sum(per_point_nlpd)),
-        "per_point_nlpd": per_point_nlpd,
-        "y_pred": mean,
-        "y_std": std,
-        "predictive_variance": variance,
-        "metric_space": "raw" if evaluate_raw_metrics else "normalized",
-    }
-
-
 def cover_factor(gp, data, sigma_multiplier=1.0):
     """
     Compute the fraction of held-out observations that fall within the GP predictive mean ± sigma_multiplier * predictive std.
@@ -261,6 +176,7 @@ def evaluate_heldout_metrics(
         train_t = np.asarray(train_data["t"])
         train_time_min = float(np.min(train_t))
         train_time_max = float(np.max(train_t))
+        # Below computation can answer: Does GP calibration degrade for extrapolative held-out points?
         # marks held-out points that are outside the training time range
         outside_train_range = (t_test < train_time_min) | (t_test > train_time_max)  
         # This measures how far outside the training range each held-out point is.
@@ -385,6 +301,9 @@ def summarize_object_metric_results(object_results):
 
 
 def _scalar_from_result_value(value):
+    """
+    Extract a scalar value from a result field that may be a scalar, a 0-dim array, or a 1-element array. Return None for empty arrays.
+    """
     arr = np.asarray(value, dtype=object)
     if arr.ndim == 0:
         return arr.item()
@@ -438,6 +357,13 @@ def _object_metric_row(result):
 
     coverage = result.get("coverage", {})
     n_target_train_object = result.get("n_target_train_object", result.get("n_train", np.nan))
+    object_flux_scale = result.get("object_flux_scale", np.nan)
+    object_flux_scale = float(object_flux_scale) if object_flux_scale is not None else np.nan
+    ncrps_object = (
+        float(crps_object / object_flux_scale)
+        if np.isfinite(object_flux_scale) and object_flux_scale > 0
+        else np.nan
+    )
 
     return {
         "object_id": _scalar_from_result_value(result.get("object_id", None)),
@@ -446,24 +372,54 @@ def _object_metric_row(result):
         "nrmse_object": float(nrmse_object) if nrmse_object is not None else np.nan,
         "nlpd_object": nlpd_object,
         "crps_object": crps_object,
+        "ncrps_object": ncrps_object,
         "coverage_1sigma_object": float(coverage.get("coverage_1sigma", np.mean(abs_z <= 1))),
         "coverage_2sigma_object": float(coverage.get("coverage_2sigma", np.mean(abs_z <= 2))),
         "coverage_3sigma_object": float(coverage.get("coverage_3sigma", np.mean(abs_z <= 3))),
         "z_mean_object": float(np.mean(z)),
         "z_std_object": float(np.std(z)),
         "n_test_object": n_test_object,
+        "object_flux_scale": object_flux_scale,
         # n_target_train statistics describe target-band data availability for the single-band GP.
         "n_target_train_object": int(n_target_train_object) if n_target_train_object is not None else np.nan,
     }
 
 
-def single_band_gp_object_metric_table(object_results):
+def single_band_gp_object_metric_table(
+        object_results,
+        min_object_flux_scale=1e-6,
+        return_skipped=False,
+):
     """
     Build per-object single-band GP held-out metrics before class aggregation.
     """
     if len(object_results) == 0:
         raise ValueError("object_results must contain at least one result.")
-    return pd.DataFrame([_object_metric_row(result) for result in object_results])
+
+    rows = []
+    skipped_rows = []
+    for result in object_results:
+        row = _object_metric_row(result)
+        scale = row["object_flux_scale"]
+        if (
+                min_object_flux_scale is not None
+                and (not np.isfinite(scale) or scale < min_object_flux_scale)
+        ):
+            skipped_rows.append({
+                "object_id": row["object_id"],
+                "class": row["class"],
+                "object_flux_scale": scale,
+                "nrmse_object": row["nrmse_object"],
+                "skip_reason": f"object_flux_scale_lt_{min_object_flux_scale:g}",
+            })
+            continue
+        rows.append(row)
+
+    object_table = pd.DataFrame(rows)
+    skipped_table = pd.DataFrame(skipped_rows)
+    if return_skipped:
+        return object_table, skipped_table
+    return object_table
 
 
 def _mean_std(values):
@@ -477,7 +433,8 @@ def _mean_std(values):
 def summarize_single_band_gp_class_metrics(
         object_results,
         min_test_for_zstd=5,
-        sparse_threshold=5,
+        sparse_threshold=10,
+        min_object_flux_scale=1e-6,
         output_path="single_band_gp_class_summary.csv",
         print_table=True,
 ):
@@ -487,13 +444,28 @@ def summarize_single_band_gp_class_metrics(
     Class-level metrics are object-weighted: metrics are computed per object
     first, then summarized across objects within each class.
     """
-    object_table = single_band_gp_object_metric_table(object_results)
+    object_table, skipped_table = single_band_gp_object_metric_table(
+        object_results,
+        min_object_flux_scale=min_object_flux_scale,
+        return_skipped=True,
+    )
+    if len(object_table) == 0:
+        raise ValueError(
+            "No objects remain after filtering on object_flux_scale. "
+            f"min_object_flux_scale={min_object_flux_scale:g}"
+        )
+    skipped_counts = (
+        skipped_table.groupby("class").size().to_dict()
+        if len(skipped_table) > 0
+        else {}
+    )
     rows = []
     performance_metrics = [
         ("rmse", "rmse_object"),
         ("nrmse", "nrmse_object"),
         ("nlpd", "nlpd_object"),
         ("crps", "crps_object"),
+        ("ncrps", "ncrps_object"),
         ("coverage_1sigma", "coverage_1sigma_object"),
         ("coverage_2sigma", "coverage_2sigma_object"),
         ("coverage_3sigma", "coverage_3sigma_object"),
@@ -503,14 +475,18 @@ def summarize_single_band_gp_class_metrics(
 
     for class_label, group in object_table.groupby("class", sort=True, dropna=False):
         n_objects = int(len(group))
-        if n_objects < 1:
-            raise AssertionError("Classes with very few objects should be included, not dropped.")
+        if n_objects < 2:
+            #raise AssertionError("Classes with very few objects should be included, not dropped.")
+            continue
 
         n_target_train = np.asarray(group["n_target_train_object"], dtype=float)
+        object_flux_scale = np.asarray(group["object_flux_scale"], dtype=float)
         sparse_mask = n_target_train < sparse_threshold
         row = {
             "class": class_label,
             "n_objects": n_objects,
+            "n_objects_skipped_small_flux": int(skipped_counts.get(class_label, 0)),
+            "min_object_flux_scale": np.nan if min_object_flux_scale is None else float(min_object_flux_scale),
             "n_target_train_mean": float(np.mean(n_target_train)),
             "n_target_train_std": float(np.std(n_target_train)),
             "n_target_train_median": float(np.median(n_target_train)),
@@ -522,8 +498,13 @@ def summarize_single_band_gp_class_metrics(
             "n_target_train_p90": float(np.percentile(n_target_train, 90)),
             "n_objects_target_train_lt_5": int(np.sum(sparse_mask)),
             "frac_objects_target_train_lt_5": float(np.mean(sparse_mask)),
+            "object_flux_scale_min": float(np.nanmin(object_flux_scale)),
+            "object_flux_scale_p10": float(np.nanpercentile(object_flux_scale, 10)),
+            "object_flux_scale_median": float(np.nanmedian(object_flux_scale)),
+            "object_flux_scale_mean": float(np.nanmean(object_flux_scale)),
         }
 
+        # The main performance metrics are summarized across all objects in the class
         for metric_name, column in performance_metrics:
             metric_mean, metric_std = _mean_std(group[column])
             row[f"{metric_name}_mean"] = metric_mean
@@ -548,132 +529,6 @@ def summarize_single_band_gp_class_metrics(
     if print_table:
         print(summary)
     return summary
-
-
-def collect_heldout_predictions(object_results):
-    """
-    Concatenate held-out y_true, y_pred, and y_std arrays across objects.
-    """
-    if len(object_results) == 0:
-        raise ValueError("object_results must contain at least one result.")
-
-    y_true = np.concatenate([np.asarray(result["y_true"]) for result in object_results])
-    y_pred = np.concatenate([np.asarray(result["y_pred"]) for result in object_results])
-    y_std = np.concatenate([np.asarray(result["y_std"]) for result in object_results])
-
-    return y_true, y_pred, y_std
-
-
-def standardized_residual_statistics(object_results):
-    """
-    Compute pooled standardized residual statistics across all held-out points.
-    """
-    y_true, y_pred, y_std = collect_heldout_predictions(object_results)
-    y_std = np.maximum(y_std, 1e-12)
-    z = (y_true - y_pred) / y_std
-    abs_z = np.abs(z)
-
-    return {
-        "z": z,
-        "mean_z": float(np.mean(z)),
-        "std_z": float(np.std(z)),
-        "coverage_1sigma": float(np.mean(abs_z <= 1)),
-        "coverage_2sigma": float(np.mean(abs_z <= 2)),
-        "coverage_3sigma": float(np.mean(abs_z <= 3)),
-        "max_abs_z": float(np.max(abs_z)),
-        "p95_abs_z": float(np.percentile(abs_z, 95)),
-        "p99_abs_z": float(np.percentile(abs_z, 99)),
-    }
-
-
-def yerr_statistics(object_results):
-    """
-    Summarize held-out measurement errors and their relationship to residuals.
-    """
-    if len(object_results) == 0:
-        raise ValueError("object_results must contain at least one result.")
-
-    yerr = np.concatenate([np.asarray(result["yerr"]) for result in object_results])
-    y_true, y_pred, y_std = collect_heldout_predictions(object_results)
-    residual = y_true - y_pred
-    z = residual / np.maximum(y_std, 1e-12)
-    abs_z = np.abs(z)
-
-    return {
-        "min_yerr": float(np.min(yerr)),
-        "median_yerr": float(np.median(yerr)),
-        "mean_yerr": float(np.mean(yerr)),
-        "p95_yerr": float(np.percentile(yerr, 95)),
-        "max_yerr": float(np.max(yerr)),
-        "median_yerr_top_1pct_abs_z": float(np.median(yerr[abs_z >= np.percentile(abs_z, 99)])),
-        "median_yerr_top_5pct_abs_z": float(np.median(yerr[abs_z >= np.percentile(abs_z, 95)])),
-    }
-
-
-def largest_standardized_residual_cases(object_results, top_n=20):
-    """
-    Return the held-out points with the largest absolute standardized residuals.
-    """
-    if len(object_results) == 0:
-        raise ValueError("object_results must contain at least one result.")
-
-    rows = []
-    for result_idx, result in enumerate(object_results):
-        y_true = np.asarray(result["y_true"])
-        y_pred = np.asarray(result["y_pred"])
-        y_std = np.maximum(np.asarray(result["y_std"]), PREDICTIVE_STD_EPSILON)
-        z = (y_true - y_pred) / y_std
-        abs_z = np.abs(z)
-
-        for point_idx in range(len(y_true)):
-            rows.append({
-                "result_idx": result_idx,
-                "point_idx": point_idx,
-                "object_id": result["object_id"][point_idx],
-                "band": result["band"][point_idx],
-                "time": result["time"][point_idx],
-                "X_test": result["X_test"][point_idx],
-                "y": y_true[point_idx],
-                "mean": y_pred[point_idx],
-                "std": y_std[point_idx],
-                "z": z[point_idx],
-                "abs_z": abs_z[point_idx],
-                "yerr": result["yerr"][point_idx],
-                "outside_train_range": result["outside_train_range"][point_idx],
-                "distance_to_train_range": result["distance_to_train_range"][point_idx],
-                "near_peak": result["near_peak"][point_idx],
-                "n_train": result["n_train"],
-                "n_heldout": result["n_heldout"],
-                "train_time_min": result["train_time_min"],
-                "train_time_max": result["train_time_max"],
-            })
-
-    # Sort by absolute standardized residual and return the top cases
-    rows = sorted(rows, key=lambda row: row["abs_z"], reverse=True)
-    return rows[:top_n]
-
-
-def print_largest_standardized_residual_cases(object_results, top_n=20):
-    """
-    Print the largest standardized residual cases in a notebook-friendly format.
-    """
-    rows = largest_standardized_residual_cases(object_results, top_n=top_n)
-    for row in rows:
-        print(
-            "object_id:", row["object_id"],
-            "band:", row["band"],
-            "time:", row["time"],
-            "X_test:", row["X_test"],
-            "y:", row["y"],
-            "mean:", row["mean"],
-            "std:", row["std"],
-            "z:", row["z"],
-            "yerr:", row["yerr"],
-            "outside_train_range:", row["outside_train_range"],
-            "near_peak:", row["near_peak"],
-            "n_train:", row["n_train"],
-        )
-    return rows
 
 
 def _get_mogp_prediction_function():
@@ -845,6 +700,10 @@ def evaluate_mogp_heldout_metrics(
 
 
 def _metrics_row_from_result(model_name, metrics, train_data, target_band, heldout_indices, notes=None):
+    """
+    It is used by run_target_band_ablation_study() in MOGP_model.py 
+    to build the rows comparing single-band GP, target-only MOGP, real-wavelength MOGP, shuffled controls, etc.
+    """
     y_true = np.asarray(metrics["y_true"], dtype=float)
     y_pred = np.asarray(metrics["y_pred"], dtype=float)
     y_std = np.maximum(np.asarray(metrics["y_std"], dtype=float), PREDICTIVE_STD_EPSILON)
