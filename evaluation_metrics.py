@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Any, Mapping, Sequence, cast
 import warnings
 
 import numpy as np
@@ -216,6 +219,7 @@ def evaluate_heldout_metrics(
         "total_crps": float(np.sum(per_point_crps)),
         "rmse": rmse,
         "nrmse": float(rmse / object_flux_scale),
+        "ncrps": float(np.mean(per_point_crps) / object_flux_scale),
         "sse": float(np.sum(squared_errors)),
         "object_flux_scale": object_flux_scale,
         "nrmse_quantile": float(nrmse_quantile),
@@ -325,7 +329,7 @@ def _require_valid_class_label(result):
     return class_label
 
 
-def _object_metric_row(result):
+def _object_metric_row(result: Mapping[str, Any]) -> dict[str, Any]:
     n_test_object = int(result.get("n_heldout", len(result.get("y_true", []))))
     if n_test_object < 1:
         object_id = _scalar_from_result_value(result.get("object_id", None))
@@ -386,12 +390,25 @@ def _object_metric_row(result):
 
 
 def single_band_gp_object_metric_table(
-        object_results,
-        min_object_flux_scale=1e-6,
-        return_skipped=False,
-):
+        object_results: Sequence[Mapping[str, Any]],
+        min_object_flux_scale: float | None = 1e-6,
+) -> pd.DataFrame:
     """
     Build per-object single-band GP held-out metrics before class aggregation.
+    """
+    object_table, _ = _single_band_gp_object_and_skipped_tables(
+        object_results,
+        min_object_flux_scale=min_object_flux_scale,
+    )
+    return object_table
+
+
+def _single_band_gp_object_and_skipped_tables(
+        object_results: Sequence[Mapping[str, Any]],
+        min_object_flux_scale: float | None = 1e-6,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build kept and skipped per-object tables for class aggregation.
     """
     if len(object_results) == 0:
         raise ValueError("object_results must contain at least one result.")
@@ -417,9 +434,7 @@ def single_band_gp_object_metric_table(
 
     object_table = pd.DataFrame(rows)
     skipped_table = pd.DataFrame(skipped_rows)
-    if return_skipped:
-        return object_table, skipped_table
-    return object_table
+    return object_table, skipped_table
 
 
 def _mean_std(values):
@@ -431,34 +446,33 @@ def _mean_std(values):
 
 
 def summarize_single_band_gp_class_metrics(
-        object_results,
-        min_test_for_zstd=5,
-        sparse_threshold=10,
-        min_object_flux_scale=1e-6,
-        output_path="single_band_gp_class_summary.csv",
-        print_table=True,
-):
+        object_results: Sequence[Mapping[str, Any]],
+        min_test_for_zstd: int = 5,
+        sparse_threshold: int = 10,
+        min_object_flux_scale: float | None = 1e-6,
+        output_path: str | Path | None = "single_band_gp_class_summary.csv",
+        print_table: bool = True,
+) -> pd.DataFrame:
     """
     Summarize single-band GP evaluation metrics by object class.
 
     Class-level metrics are object-weighted: metrics are computed per object
     first, then summarized across objects within each class.
     """
-    object_table, skipped_table = single_band_gp_object_metric_table(
+    object_table, skipped_table = _single_band_gp_object_and_skipped_tables(
         object_results,
         min_object_flux_scale=min_object_flux_scale,
-        return_skipped=True,
     )
-    if len(object_table) == 0:
+    if object_table.empty:
         raise ValueError(
             "No objects remain after filtering on object_flux_scale. "
             f"min_object_flux_scale={min_object_flux_scale:g}"
         )
-    skipped_counts = (
-        skipped_table.groupby("class").size().to_dict()
-        if len(skipped_table) > 0
-        else {}
-    )
+    skipped_counts: dict[Any, int] = {}
+    if not skipped_table.empty:
+        skipped_classes = cast(pd.Series, skipped_table["class"])
+        for skipped_class in skipped_classes:
+            skipped_counts[skipped_class] = skipped_counts.get(skipped_class, 0) + 1
     rows = []
     performance_metrics = [
         ("rmse", "rmse_object"),
@@ -473,8 +487,10 @@ def summarize_single_band_gp_class_metrics(
         ("z_std", "z_std_object"),
     ]
 
-    for class_label, group in object_table.groupby("class", sort=True, dropna=False):
-        n_objects = int(len(group))
+    class_series = cast(pd.Series, object_table["class"])
+    for class_label in sorted(pd.unique(class_series), key=str):
+        group = object_table.loc[class_series.eq(class_label), :].copy()
+        n_objects = int(group.shape[0])
         if n_objects < 2:
             #raise AssertionError("Classes with very few objects should be included, not dropped.")
             continue
@@ -511,9 +527,10 @@ def summarize_single_band_gp_class_metrics(
             row[f"{metric_name}_std"] = metric_std
 
         # Within-object z_std is unstable for very small n_test_object, so the filtered columns are included for interpretation.
-        zstd_group = group[group["n_test_object"] >= min_test_for_zstd]
-        row["n_objects_zstd_n_test_ge_5"] = int(len(zstd_group))
-        if len(zstd_group) == 0:
+        n_test_series = cast(pd.Series, group["n_test_object"])
+        zstd_group = group.loc[n_test_series.ge(min_test_for_zstd), :]
+        row["n_objects_zstd_n_test_ge_5"] = int(zstd_group.shape[0])
+        if zstd_group.empty:
             row["z_std_mean_n_test_ge_5"] = np.nan
             row["z_std_std_n_test_ge_5"] = np.nan
         else:
@@ -632,6 +649,7 @@ def evaluate_mogp_heldout_metrics(
         )
     object_flux_scale = float(max(float(object_flux_scale), nrmse_epsilon))
     per_point_nlpd = negative_log_predictive_density(y_metric, mean_metric, variance_metric)
+    per_point_crps = gaussian_crps(y_metric, mean_metric, std_metric)
 
     n_heldout = len(y_metric)
     if train_data is not None:
@@ -665,14 +683,18 @@ def evaluate_mogp_heldout_metrics(
         "metric_space": metric_space,
         "mean_nlpd": float(np.mean(per_point_nlpd)),
         "total_nlpd": float(np.sum(per_point_nlpd)),
+        "mean_crps": float(np.mean(per_point_crps)),
+        "total_crps": float(np.sum(per_point_crps)),
         "rmse": rmse,
         "nrmse": float(rmse / object_flux_scale),
+        "ncrps": float(np.mean(per_point_crps) / object_flux_scale),
         "sse": float(np.sum(squared_errors)),
         "object_flux_scale": object_flux_scale,
         "nrmse_quantile": float(nrmse_quantile),
         "coverage": coverage,
         "coverage_counts": coverage_counts,
         "per_point_nlpd": per_point_nlpd,
+        "per_point_crps": per_point_crps,
         "squared_errors": squared_errors,
         "y_true": y_metric,
         "y_pred": mean_metric,
@@ -714,6 +736,9 @@ def _metrics_row_from_result(model_name, metrics, train_data, target_band, heldo
         train_band = np.repeat(train_band.item(), len(train_data["y"]))
     target_mask = _band_equal_mask(train_band, target_band)
     coverage = metrics["coverage"]
+    object_flux_scale = float(metrics["object_flux_scale"])
+    mean_crps = float(metrics["mean_crps"])
+    ncrps = float(metrics.get("ncrps", mean_crps / max(object_flux_scale, PREDICTIVE_STD_EPSILON)))
     return {
         "model": model_name,
         "object_id": metrics["object_id"][0] if len(metrics["object_id"]) else None,
@@ -724,7 +749,9 @@ def _metrics_row_from_result(model_name, metrics, train_data, target_band, heldo
         "heldout_indices": np.asarray(heldout_indices, dtype=int),
         "rmse": float(metrics["rmse"]),
         "nrmse": float(metrics["nrmse"]),
-        "object_flux_scale": float(metrics["object_flux_scale"]),
+        "crps": mean_crps,
+        "ncrps": ncrps,
+        "object_flux_scale": object_flux_scale,
         "nlpd": float(metrics["mean_nlpd"]),
         "coverage_1sigma": float(coverage["coverage_1sigma"]),
         "coverage_2sigma": float(coverage["coverage_2sigma"]),
@@ -748,11 +775,13 @@ def summarize_metrics_by_band(object_results):
             pred = np.asarray(result["y_pred"])[mask]
             std = np.maximum(np.asarray(result["y_std"])[mask], 1e-12)
             per_point_nlpd = negative_log_predictive_density(y, pred, std ** 2)
+            per_point_crps = gaussian_crps(y, pred, std)
             z = (y - pred) / std
             rows.append({
                 "band": band,
                 "n_heldout": int(np.sum(mask)),
                 "total_nlpd": float(np.sum(per_point_nlpd)),
+                "total_crps": float(np.sum(per_point_crps)),
                 "sse": float(np.sum((y - pred) ** 2)),
                 "object_flux_scale": float(result.get("object_flux_scale", np.nan)),
                 "coverage_1sigma_count": int(np.sum(np.abs(z) <= 1)),
@@ -769,11 +798,18 @@ def summarize_metrics_by_band(object_results):
             for row in band_rows
             if np.isfinite(row["object_flux_scale"])
         ]
+        band_ncrps_values = [
+            (row["total_crps"] / row["n_heldout"]) / max(row["object_flux_scale"], 1e-8)
+            for row in band_rows
+            if np.isfinite(row["object_flux_scale"])
+        ]
         summary[band] = {
             "n_heldout": int(n),
             "nlpd": float(sum(row["total_nlpd"] for row in band_rows) / n),
+            "crps": float(sum(row["total_crps"] for row in band_rows) / n),
             "rmse": float(np.sqrt(sum(row["sse"] for row in band_rows) / n)),
             "nrmse": float(np.mean(band_nrmse_values)) if band_nrmse_values else np.nan,
+            "ncrps": float(np.mean(band_ncrps_values)) if band_ncrps_values else np.nan,
             "coverage_1sigma": float(sum(row["coverage_1sigma_count"] for row in band_rows) / n),
             "coverage_2sigma": float(sum(row["coverage_2sigma_count"] for row in band_rows) / n),
             "coverage_3sigma": float(sum(row["coverage_3sigma_count"] for row in band_rows) / n),
@@ -834,23 +870,16 @@ def _prepare_ablation_results_df(
         keep_seed_level=False,
 ):
     df = results_df.copy()
-    required = {
-        "model",
-        "object_id",
-        "target_band",
-        "n_heldout_target_band",
-        "rmse",
-        "nrmse",
-        "nlpd",
-        "coverage_1sigma",
-        "coverage_2sigma",
-        "coverage_3sigma",
-        "z_score_mean",
-        "z_score_std",
-    }
+    required = _raw_ablation_required_columns()
     missing = sorted(required - set(df.columns))
     if missing:
-        raise ValueError(f"results_df is missing required columns: {missing}")
+        raise ValueError(
+            "results_df is missing required raw ablation columns: "
+            f"{missing}. Pass the raw rows dataframe, for example "
+            "`df = pd.DataFrame(all_ablation_rows); save_gp_ablation_reports(df)`. "
+            "If you already called aggregate_gp_ablation_results(df), that aggregate "
+            "can only be saved as a precomputed aggregate."
+        )
 
     df = df[pd.to_numeric(df["n_heldout_target_band"], errors="coerce") > 0].copy()
     if len(df) == 0:
@@ -860,6 +889,37 @@ def _prepare_ablation_results_df(
         df = collapse_shuffled_wavelength_controls(df, keep_seed_level=keep_seed_level)
 
     return df
+
+
+def _raw_ablation_required_columns():
+    return {
+        "model",
+        "object_id",
+        "target_band",
+        "n_heldout_target_band",
+        "rmse",
+        "nrmse",
+        "nlpd",
+        "crps",
+        "ncrps",
+        "coverage_1sigma",
+        "coverage_2sigma",
+        "coverage_3sigma",
+        "z_score_mean",
+        "z_score_std",
+    }
+
+
+def _looks_like_precomputed_ablation_aggregate(df):
+    aggregate_markers = {
+        "model",
+        "n_object_band_cases",
+        "n_total_heldout",
+        "rmse_obs_weighted",
+        "nrmse_obs_weighted",
+        "nlpd_obs_weighted",
+    }
+    return aggregate_markers.issubset(df.columns)
 
 
 def _standard_error(values):
@@ -960,6 +1020,8 @@ def aggregate_gp_ablation_results(
             np.sqrt(np.sum(n * group["nrmse"].astype(float).to_numpy() ** 2) / np.sum(n))
         )
         row["nlpd_obs_weighted"] = _weighted_mean(group["nlpd"], n)
+        row["crps_obs_weighted"] = _weighted_mean(group["crps"], n)
+        row["ncrps_obs_weighted"] = _weighted_mean(group["ncrps"], n)
         for cov in ("coverage_1sigma", "coverage_2sigma", "coverage_3sigma"):
             row[f"{cov}_obs_weighted"] = _weighted_mean(group[cov], n)
 
@@ -980,6 +1042,8 @@ def aggregate_gp_ablation_results(
             "rmse": "rmse_object_weighted",
             "nrmse": "nrmse_object_weighted",
             "nlpd": "nlpd_object_weighted",
+            "crps": "crps_object_weighted",
+            "ncrps": "ncrps_object_weighted",
             "coverage_1sigma": "coverage_1sigma_object_weighted",
             "coverage_2sigma": "coverage_2sigma_object_weighted",
             "coverage_3sigma": "coverage_3sigma_object_weighted",
@@ -1045,6 +1109,8 @@ def compare_models_aggregated(
         delta_rmse = paired["rmse_a"].astype(float) - paired["rmse_b"].astype(float)
         delta_nrmse = paired["nrmse_a"].astype(float) - paired["nrmse_b"].astype(float)
         delta_nlpd = paired["nlpd_a"].astype(float) - paired["nlpd_b"].astype(float)
+        delta_crps = paired["crps_a"].astype(float) - paired["crps_b"].astype(float)
+        delta_ncrps = paired["ncrps_a"].astype(float) - paired["ncrps_b"].astype(float)
         delta_cov1 = paired["coverage_1sigma_a"].astype(float) - paired["coverage_1sigma_b"].astype(float)
         delta_z_std = paired["z_score_std_a"].astype(float) - paired["z_score_std_b"].astype(float)
         better_z = (
@@ -1065,6 +1131,12 @@ def compare_models_aggregated(
             "delta_nlpd_mean": float(np.mean(delta_nlpd)),
             "delta_nlpd_median": float(np.median(delta_nlpd)),
             "delta_nlpd_se": _standard_error(delta_nlpd),
+            "delta_crps_mean": float(np.mean(delta_crps)),
+            "delta_crps_median": float(np.median(delta_crps)),
+            "delta_crps_se": _standard_error(delta_crps),
+            "delta_ncrps_mean": float(np.mean(delta_ncrps)),
+            "delta_ncrps_median": float(np.median(delta_ncrps)),
+            "delta_ncrps_se": _standard_error(delta_ncrps),
             "delta_coverage_1sigma_mean": float(np.mean(delta_cov1)),
             "delta_coverage_1sigma_median": float(np.median(delta_cov1)),
             "delta_coverage_1sigma_se": _standard_error(delta_cov1),
@@ -1074,6 +1146,8 @@ def compare_models_aggregated(
             "fraction_improved_rmse": float(np.mean(delta_rmse < 0)),
             "fraction_improved_nrmse": float(np.mean(delta_nrmse < 0)),
             "fraction_improved_nlpd": float(np.mean(delta_nlpd < 0)),
+            "fraction_improved_crps": float(np.mean(delta_crps < 0)),
+            "fraction_improved_ncrps": float(np.mean(delta_ncrps < 0)),
             "fraction_better_calibrated_z_std": float(np.mean(better_z)),
         }
         out_rows.append(row)
@@ -1089,9 +1163,33 @@ def save_gp_ablation_reports(
 ):
     """
     Save standard ablation aggregate CSV reports.
+
+    Pass the raw row-level dataframe from run_target_band_ablation_study for the
+    full report set. If an already aggregated dataframe is passed, only that
+    precomputed aggregate can be saved because object-level pairing information
+    has already been collapsed away.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    results_df = results_df.copy()
+
+    raw_missing = sorted(_raw_ablation_required_columns() - set(results_df.columns))
+    if raw_missing and _looks_like_precomputed_ablation_aggregate(results_df):
+        paths = {
+            "by_model": output_dir / "gp_ablation_aggregated_by_model.csv",
+        }
+        results_df.to_csv(paths["by_model"], index=False)
+        return {
+            "aggregated_by_model": results_df,
+            "aggregated_by_model_and_band": None,
+            "paired_model_comparisons": None,
+            "paths": paths,
+            "notes": (
+                "Input was already aggregated, so only the provided aggregate "
+                "was saved. Pass raw ablation rows to save gp_ablation_rows, "
+                "by-model-and-band, and paired-comparison reports."
+            ),
+        }
 
     by_model = aggregate_gp_ablation_results(
         results_df,
@@ -1112,10 +1210,12 @@ def save_gp_ablation_reports(
     )
 
     paths = {
+        "rows": output_dir / "gp_ablation_rows.csv",
         "by_model": output_dir / "gp_ablation_aggregated_by_model.csv",
         "by_model_and_band": output_dir / "gp_ablation_aggregated_by_model_and_band.csv",
         "paired_model_comparisons": output_dir / "gp_ablation_paired_model_comparisons.csv",
     }
+    results_df.copy().to_csv(paths["rows"], index=False)
     by_model.to_csv(paths["by_model"], index=False)
     by_model_band.to_csv(paths["by_model_and_band"], index=False)
     comparisons.to_csv(paths["paired_model_comparisons"], index=False)
@@ -1153,6 +1253,10 @@ def plot_gp_ablation_summary(
     for metric, title, filename in [
         ("nlpd_obs_weighted", "Observation-weighted NLPD by model", "nlpd_observation_weighted_by_model.png"),
         ("nlpd_object_weighted", "Object-weighted NLPD by model", "nlpd_object_weighted_by_model.png"),
+        ("crps_obs_weighted", "Observation-weighted CRPS by model", "crps_observation_weighted_by_model.png"),
+        ("crps_object_weighted", "Object-weighted CRPS by model", "crps_object_weighted_by_model.png"),
+        ("ncrps_obs_weighted", "Observation-weighted NCRPS by model", "ncrps_observation_weighted_by_model.png"),
+        ("ncrps_object_weighted", "Object-weighted NCRPS by model", "ncrps_object_weighted_by_model.png"),
         ("nrmse_obs_weighted", "Observation-weighted NRMSE by model", "nrmse_observation_weighted_by_model.png"),
         ("nrmse_object_weighted", "Object-weighted NRMSE by model", "nrmse_object_weighted_by_model.png"),
     ]:

@@ -1016,6 +1016,7 @@ def run_target_band_ablation_study(
         nrmse_epsilon=1e-8,
         single_gp_kwargs=None,
         mogp_gp_kwargs=None,
+        output_csv_path=None,
 ):
     """
     Run target-band ablations separating training-set size from cross-band covariance.
@@ -1322,6 +1323,9 @@ def run_target_band_ablation_study(
         if not np.array_equal(np.asarray(row["heldout_indices"], dtype=int), expected_heldout):
             raise AssertionError(f"Held-out indices differ for model {row['model']}.")
 
+    if output_csv_path is not None:
+        pd.DataFrame(rows).to_csv(output_csv_path, index=False)
+
     return {
         "object_id": example["object_id"],
         "target_band": target_band,
@@ -1518,4 +1522,3 @@ def run_mogp_evaluation(
         "scanned_examples": scanned,
         "bands": bands,
     }
-
