@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
+import math
 import warnings
 
 import numpy as np
 import pandas as pd
 from scipy.special import ndtr
-from scipy.stats import norm
+from scipy.stats import kstest
+
 
 from singleGP_model import (
     _assert_z_score_invariance,
@@ -18,6 +20,206 @@ from singleGP_model import (
 )
 
 PREDICTIVE_STD_EPSILON = 1e-12
+
+
+def _pit_bin_edges(bins):
+    """Compute the edges of the PIT bins."""
+    if isinstance(bins, (int, np.integer)):
+        return np.linspace(0.0, 1.0, int(bins) + 1)
+    return np.asarray(bins, dtype=float)
+
+
+def _object_array_from_result(result, primary_key, n_values, fallback_key=None):
+    value = result.get(primary_key, None)
+    if value is None and fallback_key is not None:
+        value = result.get(fallback_key, None)
+    if value is None:
+        return np.full(n_values, None, dtype=object)
+
+    values = np.asarray(value, dtype=object)
+    if values.ndim == 0:
+        return np.full(n_values, values.item(), dtype=object)
+    return values
+
+
+def _valid_pit_values(pit_values):
+    pit_values = np.asarray(pit_values, dtype=float).reshape(-1)
+    return pit_values[np.isfinite(pit_values)]
+
+
+def compute_pit_values(y_true, mu_pred, sigma_pred, epsilon=PREDICTIVE_STD_EPSILON):
+    """
+    Compute standardized residuals and probability integral transform values.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    mu_pred = np.asarray(mu_pred, dtype=float)
+    sigma_pred = np.maximum(np.asarray(sigma_pred, dtype=float), epsilon)
+    if not np.all(sigma_pred > 0):
+        raise AssertionError("sigma_pred must be positive after clipping.")
+
+    z_values = (y_true - mu_pred) / sigma_pred
+    pit_values = np.clip(ndtr(z_values), 0.0, 1.0)
+    return z_values, pit_values
+
+
+def compute_ks_pit(pit_values):
+    """
+    Compute the Kolmogorov-Smirnov distance between PIT values and Uniform(0, 1).
+    """
+    valid_pit = _valid_pit_values(pit_values)
+    if len(valid_pit) == 0:
+        return np.nan
+
+    return float(kstest(valid_pit, "uniform").statistic)
+
+
+def compute_pit_histogram(pit_values, bins=20, density=True):
+    """
+    Histogram PIT values on the fixed [0, 1] range.
+    """
+    valid_pit = _valid_pit_values(pit_values)
+    bin_edges = _pit_bin_edges(bins)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    if len(valid_pit) == 0:
+        return bin_edges, bin_centers, np.full(len(bin_centers), np.nan)
+
+    hist_values, bin_edges = np.histogram(valid_pit, bins=bin_edges, range=(0.0, 1.0), density=density)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    return bin_edges, bin_centers, hist_values.astype(float)
+
+
+def compute_pit_reliability_curve(pit_values, q_grid=None):
+    """
+    Empirical PIT CDF evaluated over a nominal probability grid.
+    """
+    if q_grid is None:
+        q_grid = np.linspace(0.0, 1.0, 101)
+    q_grid = np.asarray(q_grid, dtype=float)
+    valid_pit = _valid_pit_values(pit_values)
+    if len(valid_pit) == 0:
+        return q_grid, np.full_like(q_grid, np.nan, dtype=float)
+
+    empirical_cdf_values = np.asarray([np.mean(valid_pit <= q) for q in q_grid], dtype=float)
+    return q_grid, empirical_cdf_values
+
+
+def compute_object_weighted_pit_histogram(pit_by_object, bins=20):
+    """
+    Average density-normalized PIT histograms with each object weighted equally.
+    """
+    bin_edges = _pit_bin_edges(bins)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    densities = []
+    for pit_values in pit_by_object.values():
+        valid_pit = _valid_pit_values(pit_values)
+        if len(valid_pit) == 0:
+            continue
+        hist_values, _ = np.histogram(valid_pit, bins=bin_edges, range=(0.0, 1.0), density=True)
+        densities.append(hist_values)
+    if len(densities) == 0:
+        return bin_edges, bin_centers, np.full(len(bin_centers), np.nan)
+    return bin_edges, bin_centers, np.mean(np.vstack(densities), axis=0)
+
+
+def compute_object_weighted_pit_reliability_curve(pit_by_object, q_grid=None):
+    """
+    Average object-level PIT empirical CDFs with each object weighted equally.
+    """
+    if q_grid is None:
+        q_grid = np.linspace(0.0, 1.0, 101)
+    q_grid = np.asarray(q_grid, dtype=float)
+    curves = []
+    for pit_values in pit_by_object.values():
+        valid_pit = _valid_pit_values(pit_values)
+        if len(valid_pit) == 0:
+            continue
+        _, empirical_cdf = compute_pit_reliability_curve(valid_pit, q_grid=q_grid)
+        curves.append(empirical_cdf)
+    if len(curves) == 0:
+        return q_grid, np.full_like(q_grid, np.nan, dtype=float)
+    return q_grid, np.mean(np.vstack(curves), axis=0)
+
+
+def compute_object_weighted_ks_pit(pit_by_object, q_grid=None):
+    """
+    KS-PIT from the average object-level PIT empirical CDF.
+    """
+    q_grid, mean_empirical_cdf = compute_object_weighted_pit_reliability_curve(
+        pit_by_object,
+        q_grid=q_grid,
+    )
+    valid = np.isfinite(mean_empirical_cdf) & np.isfinite(q_grid)
+    if not np.any(valid):
+        return np.nan
+    return float(np.max(np.abs(mean_empirical_cdf[valid] - q_grid[valid])))
+
+
+def plot_pit_histogram(pit_values, title=None, bins=20, save_path=None, density=True):
+    """
+    Plot a PIT histogram with the Uniform(0, 1) reference density.
+    """
+    import matplotlib.pyplot as plt
+
+    bin_edges, _, hist_values = compute_pit_histogram(pit_values, bins=bins, density=density)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(
+        bin_edges[:-1],
+        hist_values,
+        width=np.diff(bin_edges),
+        align="edge",
+        edgecolor="black",
+        alpha=0.8,
+    )
+    if density:
+        ax.axhline(1.0, color="black", linestyle="--", linewidth=1, label="ideal")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xlabel("PIT value")
+    ax.set_ylabel("Density" if density else "Count")
+    if title is not None:
+        ax.set_title(title)
+    if density:
+        ax.legend()
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig, ax
+
+
+def plot_pit_reliability_curve(pit_values, title=None, q_grid=None, save_path=None):
+    """
+    Plot the empirical PIT CDF against the ideal diagonal.
+    """
+    import matplotlib.pyplot as plt
+
+    q_grid, empirical_cdf_values = compute_pit_reliability_curve(pit_values, q_grid=q_grid)
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.plot(q_grid, empirical_cdf_values, label="empirical")
+    ax.plot([0.0, 1.0], [0.0, 1.0], color="black", linestyle="--", linewidth=1, label="ideal")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("Nominal probability q")
+    ax.set_ylabel("Empirical fraction PIT <= q")
+    if title is not None:
+        ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig, ax
+
+
+def _pit_by_object_from_results(object_results):
+    pit_by_object = {}
+    for result_idx, result in enumerate(object_results):
+        object_id = _hashable_object_id(_scalar_from_result_value(result.get("object_id", None)))
+        if object_id is None:
+            object_id = result_idx
+        pit_values = result.get("pit_values", None)
+        if pit_values is None:
+            _, pit_values = compute_pit_values(result["y_true"], result["y_pred"], result["y_std"])
+        pit_by_object[object_id] = np.asarray(pit_values, dtype=float).reshape(-1)
+    return pit_by_object
+
 
 def negative_log_predictive_density(y_true, mean, variance):
     """
@@ -152,6 +354,9 @@ def evaluate_heldout_metrics(
 
     errors_metric = y_metric - mean_metric
     squared_errors = errors_metric ** 2
+    z_values, pit_values = compute_pit_values(y_metric, mean_metric, std_metric)
+    ks_pit_object = compute_ks_pit(pit_values)
+    n_pit_object = int(np.sum(np.isfinite(pit_values)))
     rmse = float(np.sqrt(np.mean(squared_errors)))
     if object_flux_scale is None:
         if object_data is not None:
@@ -228,6 +433,10 @@ def evaluate_heldout_metrics(
         "per_point_nlpd": per_point_nlpd,
         "per_point_crps": per_point_crps,
         "squared_errors": squared_errors,
+        "z_values": z_values,
+        "pit_values": pit_values,
+        "ks_pit_object": ks_pit_object,
+        "n_pit_object": n_pit_object,
         "y_true": y_metric,
         "y_pred": mean_metric,
         "y_std": std_metric,
@@ -270,6 +479,15 @@ def summarize_object_metric_results(object_results):
     train_total = int(sum(result["n_train"] for result in object_results if result["n_train"] is not None))
 
     coverage_keys = sorted(object_results[0]["coverage"].keys())
+    pit_by_object = _pit_by_object_from_results(object_results)
+    valid_pit_arrays = [
+        valid_pit
+        for valid_pit in (_valid_pit_values(pit_values) for pit_values in pit_by_object.values())
+        if len(valid_pit) > 0
+    ]
+    pooled_pit = np.concatenate(valid_pit_arrays) if valid_pit_arrays else np.array([], dtype=float)
+    ks_pit_obs_weighted = compute_ks_pit(pooled_pit)
+    ks_pit_object_weighted = compute_object_weighted_ks_pit(pit_by_object)
 
     observation_weighted = {
         "nlpd": float(sum(result["total_nlpd"] for result in object_results) / n_total),
@@ -279,12 +497,14 @@ def summarize_object_metric_results(object_results):
             [result["nrmse"] ** 2 for result in object_results],
             weights=[result["n_heldout"] for result in object_results],
         ))),
+        "ks_pit": ks_pit_obs_weighted,
     }
     object_weighted = {
         "nlpd": float(np.mean([result["mean_nlpd"] for result in object_results])),
         "crps": float(np.mean([result["mean_crps"] for result in object_results])),
         "rmse": float(np.mean([result["rmse"] for result in object_results])),
         "nrmse": float(np.mean([result["nrmse"] for result in object_results])),
+        "ks_pit": ks_pit_object_weighted,
     }
 
     for key in coverage_keys:
@@ -299,6 +519,8 @@ def summarize_object_metric_results(object_results):
         "n_objects": n_objects,
         "n_heldout_total": n_total,
         "n_train_total": train_total,
+        "ks_pit_obs_weighted": ks_pit_obs_weighted,
+        "ks_pit_object_weighted": ks_pit_object_weighted,
         "observation_weighted": observation_weighted,
         "object_weighted": object_weighted,
     }
@@ -314,6 +536,16 @@ def _scalar_from_result_value(value):
     if len(arr) == 0:
         return None
     return arr.reshape(-1)[0]
+
+
+def _hashable_object_id(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return tuple(value.reshape(-1).tolist())
+    if isinstance(value, list):
+        return tuple(value)
+    return value
 
 
 def _require_valid_class_label(result):
@@ -341,7 +573,7 @@ def _object_metric_row(result: Mapping[str, Any]) -> dict[str, Any]:
     if not np.all(y_std > 0):
         raise AssertionError("sigma_pred must be positive after clipping.")
 
-    z = (y_true - y_pred) / y_std
+    z, pit = compute_pit_values(y_true, y_pred, y_std)
     abs_z = np.abs(z)
     squared_errors = (y_true - y_pred) ** 2
     rmse_object = float(result.get("rmse", np.sqrt(np.mean(squared_errors))))
@@ -382,6 +614,8 @@ def _object_metric_row(result: Mapping[str, Any]) -> dict[str, Any]:
         "coverage_3sigma_object": float(coverage.get("coverage_3sigma", np.mean(abs_z <= 3))),
         "z_mean_object": float(np.mean(z)),
         "z_std_object": float(np.std(z)),
+        "ks_pit_object": float(result.get("ks_pit_object", compute_ks_pit(pit))),
+        "n_pit_object": int(result.get("n_pit_object", np.sum(np.isfinite(pit)))),
         "n_test_object": n_test_object,
         "object_flux_scale": object_flux_scale,
         # n_target_train statistics describe target-band data availability for the single-band GP.
@@ -452,6 +686,9 @@ def summarize_single_band_gp_class_metrics(
         min_object_flux_scale: float | None = 1e-6,
         output_path: str | Path | None = "single_band_gp_class_summary.csv",
         print_table: bool = True,
+        plot_pit: bool = False,
+        pit_output_dir: str | Path | None = None,
+        pit_bins: int = 20,
 ) -> pd.DataFrame:
     """
     Summarize single-band GP evaluation metrics by object class.
@@ -468,12 +705,16 @@ def summarize_single_band_gp_class_metrics(
             "No objects remain after filtering on object_flux_scale. "
             f"min_object_flux_scale={min_object_flux_scale:g}"
         )
+    if plot_pit and pit_output_dir is not None:
+        pit_output_dir = Path(pit_output_dir)
+        pit_output_dir.mkdir(parents=True, exist_ok=True)
     skipped_counts: dict[Any, int] = {}
     if not skipped_table.empty:
         skipped_classes = cast(pd.Series, skipped_table["class"])
         for skipped_class in skipped_classes:
             skipped_counts[skipped_class] = skipped_counts.get(skipped_class, 0) + 1
     rows = []
+
     performance_metrics = [
         ("rmse", "rmse_object"),
         ("nrmse", "nrmse_object"),
@@ -485,6 +726,7 @@ def summarize_single_band_gp_class_metrics(
         ("coverage_3sigma", "coverage_3sigma_object"),
         ("z_mean", "z_mean_object"),
         ("z_std", "z_std_object"),
+        ("ks_pit", "ks_pit_object"),
     ]
 
     class_series = cast(pd.Series, object_table["class"])
@@ -525,6 +767,39 @@ def summarize_single_band_gp_class_metrics(
             metric_mean, metric_std = _mean_std(group[column])
             row[f"{metric_name}_mean"] = metric_mean
             row[f"{metric_name}_std"] = metric_std
+
+        if plot_pit:
+            class_object_ids = set(group["object_id"].tolist())
+            class_pit_arrays = []
+            for result in object_results:
+                object_id = _scalar_from_result_value(result.get("object_id", None))
+                if object_id not in class_object_ids:
+                    continue
+                pit_values = result.get("pit_values", None)
+                if pit_values is None:
+                    _, pit_values = compute_pit_values(result["y_true"], result["y_pred"], result["y_std"])
+                valid_pit = _valid_pit_values(pit_values)
+                if len(valid_pit) > 0:
+                    class_pit_arrays.append(valid_pit)
+            class_pit = np.concatenate(class_pit_arrays) if class_pit_arrays else np.array([], dtype=float)
+            safe_class = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(class_label))
+            histogram_path = None
+            reliability_path = None
+            if pit_output_dir is not None:
+                pit_dir = Path(pit_output_dir)
+                histogram_path = pit_dir / f"pit_histogram_{safe_class}.png"
+                reliability_path = pit_dir / f"pit_reliability_{safe_class}.png"
+            plot_pit_histogram(
+                class_pit,
+                title=f"PIT histogram: {class_label}",
+                bins=pit_bins,
+                save_path=histogram_path,
+            )
+            plot_pit_reliability_curve(
+                class_pit,
+                title=f"PIT reliability: {class_label}",
+                save_path=reliability_path,
+            )
 
         # Within-object z_std is unstable for very small n_test_object, so the filtered columns are included for interpretation.
         n_test_series = cast(pd.Series, group["n_test_object"])
@@ -638,6 +913,9 @@ def evaluate_mogp_heldout_metrics(
         metric_space = "normalized"
 
     squared_errors = (y_metric - mean_metric) ** 2
+    z_values, pit_values = compute_pit_values(y_metric, mean_metric, std_metric)
+    ks_pit_object = compute_ks_pit(pit_values)
+    n_pit_object = int(np.sum(np.isfinite(pit_values)))
     rmse = float(np.sqrt(np.mean(squared_errors)))
     if object_flux_scale is None:
         object_flux_scale = object_level_empirical_flux_scale(
@@ -696,6 +974,10 @@ def evaluate_mogp_heldout_metrics(
         "per_point_nlpd": per_point_nlpd,
         "per_point_crps": per_point_crps,
         "squared_errors": squared_errors,
+        "z_values": z_values,
+        "pit_values": pit_values,
+        "ks_pit_object": ks_pit_object,
+        "n_pit_object": n_pit_object,
         "y_true": y_metric,
         "y_pred": mean_metric,
         "y_std": std_metric,
@@ -721,6 +1003,8 @@ def evaluate_mogp_heldout_metrics(
     }
 
 
+"""--------------------ablation study functions--------------------"""
+
 def _metrics_row_from_result(model_name, metrics, train_data, target_band, heldout_indices, notes=None):
     """
     It is used by run_target_band_ablation_study() in MOGP_model.py 
@@ -729,8 +1013,7 @@ def _metrics_row_from_result(model_name, metrics, train_data, target_band, heldo
     y_true = np.asarray(metrics["y_true"], dtype=float)
     y_pred = np.asarray(metrics["y_pred"], dtype=float)
     y_std = np.maximum(np.asarray(metrics["y_std"], dtype=float), PREDICTIVE_STD_EPSILON)
-    z = (y_true - y_pred) / y_std
-    pit = norm.cdf(z)
+    z, pit = compute_pit_values(y_true, y_pred, y_std)
     train_band = np.asarray(train_data["band"], dtype=object)
     if train_band.ndim == 0:
         train_band = np.repeat(train_band.item(), len(train_data["y"]))
@@ -758,7 +1041,11 @@ def _metrics_row_from_result(model_name, metrics, train_data, target_band, heldo
         "coverage_3sigma": float(coverage["coverage_3sigma"]),
         "z_score_mean": float(np.mean(z)),
         "z_score_std": float(np.std(z)),
+        "ks_pit": float(metrics.get("ks_pit_object", compute_ks_pit(pit))),
+        "z_scores": z,
         "pit": pit,
+        "y_true": y_true,
+        "y_pred": y_pred,
         "notes": notes,
     }
 
@@ -776,7 +1063,7 @@ def summarize_metrics_by_band(object_results):
             std = np.maximum(np.asarray(result["y_std"])[mask], 1e-12)
             per_point_nlpd = negative_log_predictive_density(y, pred, std ** 2)
             per_point_crps = gaussian_crps(y, pred, std)
-            z = (y - pred) / std
+            z, pit = compute_pit_values(y, pred, std)
             rows.append({
                 "band": band,
                 "n_heldout": int(np.sum(mask)),
@@ -787,6 +1074,7 @@ def summarize_metrics_by_band(object_results):
                 "coverage_1sigma_count": int(np.sum(np.abs(z) <= 1)),
                 "coverage_2sigma_count": int(np.sum(np.abs(z) <= 2)),
                 "coverage_3sigma_count": int(np.sum(np.abs(z) <= 3)),
+                "pit_values": pit,
             })
 
     summary = {}
@@ -803,6 +1091,16 @@ def summarize_metrics_by_band(object_results):
             for row in band_rows
             if np.isfinite(row["object_flux_scale"])
         ]
+        pit_by_object = {
+            row_idx: row["pit_values"]
+            for row_idx, row in enumerate(band_rows)
+        }
+        pooled_pit_arrays = [
+            _valid_pit_values(row["pit_values"])
+            for row in band_rows
+            if len(_valid_pit_values(row["pit_values"])) > 0
+        ]
+        pooled_pit = np.concatenate(pooled_pit_arrays) if pooled_pit_arrays else np.array([], dtype=float)
         summary[band] = {
             "n_heldout": int(n),
             "nlpd": float(sum(row["total_nlpd"] for row in band_rows) / n),
@@ -813,6 +1111,8 @@ def summarize_metrics_by_band(object_results):
             "coverage_1sigma": float(sum(row["coverage_1sigma_count"] for row in band_rows) / n),
             "coverage_2sigma": float(sum(row["coverage_2sigma_count"] for row in band_rows) / n),
             "coverage_3sigma": float(sum(row["coverage_3sigma_count"] for row in band_rows) / n),
+            "ks_pit_obs_weighted": compute_ks_pit(pooled_pit),
+            "ks_pit_object_weighted": compute_object_weighted_ks_pit(pit_by_object),
         }
     return summary
 
@@ -907,6 +1207,7 @@ def _raw_ablation_required_columns():
         "coverage_3sigma",
         "z_score_mean",
         "z_score_std",
+        "ks_pit",
     }
 
 
@@ -959,6 +1260,12 @@ def _aggregate_residual_level_if_available(group):
             z = row.get("z_scores")
             if z is not None:
                 z_values.append(np.asarray(z, dtype=float).reshape(-1))
+    pit_values = []
+    if "pit" in group.columns:
+        for _, row in group.iterrows():
+            pit = row.get("pit")
+            if pit is not None:
+                pit_values.append(np.asarray(pit, dtype=float).reshape(-1))
 
     out = {}
     if len(y_true_values) > 0:
@@ -969,6 +1276,8 @@ def _aggregate_residual_level_if_available(group):
         z_all = np.concatenate(z_values)
         out["z_score_mean_obs_weighted"] = float(np.mean(z_all))
         out["z_score_std_obs_weighted"] = float(np.std(z_all))
+    if len(pit_values) > 0:
+        out["ks_pit_obs_weighted"] = compute_ks_pit(np.concatenate(pit_values))
     return out
 
 
@@ -1022,6 +1331,20 @@ def aggregate_gp_ablation_results(
         row["nlpd_obs_weighted"] = _weighted_mean(group["nlpd"], n)
         row["crps_obs_weighted"] = _weighted_mean(group["crps"], n)
         row["ncrps_obs_weighted"] = _weighted_mean(group["ncrps"], n)
+        if "pit" in group.columns:
+            pit_arrays = [
+                _valid_pit_values(row.get("pit"))
+                for _, row in group.iterrows()
+                if row.get("pit") is not None and len(_valid_pit_values(row.get("pit"))) > 0
+            ]
+            pooled_pit = np.concatenate(pit_arrays) if pit_arrays else np.array([], dtype=float)
+            row["ks_pit_obs_weighted"] = compute_ks_pit(pooled_pit)
+            row["ks_pit_object_weighted"] = compute_object_weighted_ks_pit(
+                {idx: pit_values for idx, pit_values in enumerate(pit_arrays)}
+            )
+        else:
+            row["ks_pit_obs_weighted"] = _weighted_mean(group["ks_pit"], n)
+            row["ks_pit_object_weighted"] = float(np.mean(group["ks_pit"].astype(float).to_numpy()))
         for cov in ("coverage_1sigma", "coverage_2sigma", "coverage_3sigma"):
             row[f"{cov}_obs_weighted"] = _weighted_mean(group[cov], n)
 
@@ -1056,6 +1379,9 @@ def aggregate_gp_ablation_results(
             # compute object-weighted standard deviation and standard error for the metric
             row[f"{src}_object_std"] = float(np.std(values, ddof=1)) if len(values) > 1 else np.nan
             row[f"{src}_object_se"] = _standard_error(values)
+        ks_values = group["ks_pit"].astype(float).to_numpy()
+        row["ks_pit_object_std"] = float(np.std(ks_values, ddof=1)) if len(ks_values) > 1 else np.nan
+        row["ks_pit_object_se"] = _standard_error(ks_values)
 
         rows.append(row)
 
@@ -1113,6 +1439,7 @@ def compare_models_aggregated(
         delta_ncrps = paired["ncrps_a"].astype(float) - paired["ncrps_b"].astype(float)
         delta_cov1 = paired["coverage_1sigma_a"].astype(float) - paired["coverage_1sigma_b"].astype(float)
         delta_z_std = paired["z_score_std_a"].astype(float) - paired["z_score_std_b"].astype(float)
+        delta_ks_pit = paired["ks_pit_a"].astype(float) - paired["ks_pit_b"].astype(float)
         better_z = (
             np.abs(paired["z_score_std_a"].astype(float) - 1.0)
             < np.abs(paired["z_score_std_b"].astype(float) - 1.0)
@@ -1143,11 +1470,15 @@ def compare_models_aggregated(
             "delta_z_score_std_mean": float(np.mean(delta_z_std)),
             "delta_z_score_std_median": float(np.median(delta_z_std)),
             "delta_z_score_std_se": _standard_error(delta_z_std),
+            "delta_ks_pit_mean": float(np.mean(delta_ks_pit)),
+            "delta_ks_pit_median": float(np.median(delta_ks_pit)),
+            "delta_ks_pit_se": _standard_error(delta_ks_pit),
             "fraction_improved_rmse": float(np.mean(delta_rmse < 0)),
             "fraction_improved_nrmse": float(np.mean(delta_nrmse < 0)),
             "fraction_improved_nlpd": float(np.mean(delta_nlpd < 0)),
             "fraction_improved_crps": float(np.mean(delta_crps < 0)),
             "fraction_improved_ncrps": float(np.mean(delta_ncrps < 0)),
+            "fraction_improved_ks_pit": float(np.mean(delta_ks_pit < 0)),
             "fraction_better_calibrated_z_std": float(np.mean(better_z)),
         }
         out_rows.append(row)
@@ -1259,6 +1590,8 @@ def plot_gp_ablation_summary(
         ("ncrps_object_weighted", "Object-weighted NCRPS by model", "ncrps_object_weighted_by_model.png"),
         ("nrmse_obs_weighted", "Observation-weighted NRMSE by model", "nrmse_observation_weighted_by_model.png"),
         ("nrmse_object_weighted", "Object-weighted NRMSE by model", "nrmse_object_weighted_by_model.png"),
+        ("ks_pit_obs_weighted", "Observation-weighted KS-PIT by model", "ks_pit_observation_weighted_by_model.png"),
+        ("ks_pit_object_weighted", "Object-weighted KS-PIT by model", "ks_pit_object_weighted_by_model.png"),
     ]:
         fig, ax = plt.subplots(figsize=(10, 5))
         ordered = agg.sort_values(metric)
