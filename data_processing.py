@@ -146,7 +146,7 @@ def _find_peak_indices(y, peak_mode="absolute"):
     return np.flatnonzero(np.isclose(peak_values, np.max(peak_values)))
 
 
-def _find_alignment_peak_time(example, target_band, t, y, peak_alignment):
+def _find_alignment_peak_time(example, t, y, peak_alignment):
     if peak_alignment == "target_peak":
         return t[np.argmax(y)]
     if peak_alignment == "target_abs_peak":
@@ -574,7 +574,6 @@ def process_one_obj_one_band(
     if align_peak:
         alignment_peak_time = _find_alignment_peak_time(
             example,
-            target_band,
             t,
             y,
             peak_alignment,
@@ -764,7 +763,6 @@ def process_one_obj_one_band_train_heldout(
         # Use only target-band training observations to avoid leakage.
         alignment_peak_time = _find_alignment_peak_time(
             example,
-            target_band,
             train_t_raw,
             train_y_gp_raw,
             peak_alignment if not peak_alignment.startswith("global") else "target_abs_peak",

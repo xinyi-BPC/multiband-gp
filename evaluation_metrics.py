@@ -7,8 +7,19 @@ import warnings
 
 import numpy as np
 import pandas as pd
-from scipy.special import ndtr
-from scipy.stats import kstest
+try:
+    from scipy.special import ndtr
+except Exception:
+    def ndtr(x):
+        x = np.asarray(x, dtype=float)
+        erf_values = np.asarray([math.erf(value) for value in (x / np.sqrt(2.0)).reshape(-1)], dtype=float)
+        erf_values = erf_values.reshape(x.shape)
+        return 0.5 * (1.0 + erf_values)
+
+try:
+    from scipy.stats import kstest
+except Exception:
+    kstest = None
 
 
 from singleGP_model import (
@@ -70,7 +81,16 @@ def compute_ks_pit(pit_values):
     if len(valid_pit) == 0:
         return np.nan
 
-    return float(kstest(valid_pit, "uniform").statistic)
+    if kstest is not None:
+        return float(kstest(valid_pit, "uniform").statistic)
+
+    sorted_pit = np.sort(valid_pit)
+    n = len(sorted_pit)
+    empirical_upper = np.arange(1, n + 1, dtype=float) / n
+    empirical_lower = np.arange(0, n, dtype=float) / n
+    d_plus = np.max(empirical_upper - sorted_pit)
+    d_minus = np.max(sorted_pit - empirical_lower)
+    return float(max(d_plus, d_minus))
 
 
 def compute_pit_histogram(pit_values, bins=20, density=True):
@@ -154,14 +174,8 @@ def compute_object_weighted_ks_pit(pit_by_object, q_grid=None):
     return float(np.max(np.abs(mean_empirical_cdf[valid] - q_grid[valid])))
 
 
-def plot_pit_histogram(pit_values, title=None, bins=20, save_path=None, density=True):
-    """
-    Plot a PIT histogram with the Uniform(0, 1) reference density.
-    """
-    import matplotlib.pyplot as plt
-
+def _plot_pit_histogram_on_axis(ax, pit_values, title=None, bins=20, density=True):
     bin_edges, _, hist_values = compute_pit_histogram(pit_values, bins=bins, density=density)
-    fig, ax = plt.subplots(figsize=(7, 4))
     ax.bar(
         bin_edges[:-1],
         hist_values,
@@ -179,6 +193,31 @@ def plot_pit_histogram(pit_values, title=None, bins=20, save_path=None, density=
         ax.set_title(title)
     if density:
         ax.legend()
+    return ax
+
+
+def _plot_pit_reliability_on_axis(ax, pit_values, title=None, q_grid=None):
+    q_grid, empirical_cdf_values = compute_pit_reliability_curve(pit_values, q_grid=q_grid)
+    ax.plot(q_grid, empirical_cdf_values, label="empirical")
+    ax.plot([0.0, 1.0], [0.0, 1.0], color="black", linestyle="--", linewidth=1, label="ideal")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("Nominal probability q")
+    ax.set_ylabel("Empirical fraction PIT <= q")
+    if title is not None:
+        ax.set_title(title)
+    ax.legend()
+    return ax
+
+
+def plot_pit_histogram(pit_values, title=None, bins=20, save_path=None, density=True):
+    """
+    Plot a PIT histogram with the Uniform(0, 1) reference density.
+    """
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    _plot_pit_histogram_on_axis(ax, pit_values, title=title, bins=bins, density=density)
     fig.tight_layout()
     if save_path is not None:
         fig.savefig(save_path, bbox_inches="tight")
@@ -191,21 +230,49 @@ def plot_pit_reliability_curve(pit_values, title=None, q_grid=None, save_path=No
     """
     import matplotlib.pyplot as plt
 
-    q_grid, empirical_cdf_values = compute_pit_reliability_curve(pit_values, q_grid=q_grid)
     fig, ax = plt.subplots(figsize=(5, 5))
-    ax.plot(q_grid, empirical_cdf_values, label="empirical")
-    ax.plot([0.0, 1.0], [0.0, 1.0], color="black", linestyle="--", linewidth=1, label="ideal")
-    ax.set_xlim(0.0, 1.0)
-    ax.set_ylim(0.0, 1.0)
-    ax.set_xlabel("Nominal probability q")
-    ax.set_ylabel("Empirical fraction PIT <= q")
-    if title is not None:
-        ax.set_title(title)
-    ax.legend()
+    _plot_pit_reliability_on_axis(ax, pit_values, title=title, q_grid=q_grid)
     fig.tight_layout()
     if save_path is not None:
         fig.savefig(save_path, bbox_inches="tight")
     return fig, ax
+
+
+def plot_pit_diagnostics(
+        pit_values,
+        title=None,
+        bins=20,
+        q_grid=None,
+        save_path=None,
+        density=True,
+):
+    """
+    Plot PIT histogram and PIT reliability curve side by side.
+    """
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    histogram_title = "PIT histogram"
+    reliability_title = "PIT reliability"
+    if title is not None:
+        fig.suptitle(title)
+    _plot_pit_histogram_on_axis(
+        axes[0],
+        pit_values,
+        title=histogram_title,
+        bins=bins,
+        density=density,
+    )
+    _plot_pit_reliability_on_axis(
+        axes[1],
+        pit_values,
+        title=reliability_title,
+        q_grid=q_grid,
+    )
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig, axes
 
 
 def _pit_by_object_from_results(object_results):
@@ -734,7 +801,6 @@ def summarize_single_band_gp_class_metrics(
         group = object_table.loc[class_series.eq(class_label), :].copy()
         n_objects = int(group.shape[0])
         if n_objects < 2:
-            #raise AssertionError("Classes with very few objects should be included, not dropped.")
             continue
 
         n_target_train = np.asarray(group["n_target_train_object"], dtype=float)
@@ -783,22 +849,15 @@ def summarize_single_band_gp_class_metrics(
                     class_pit_arrays.append(valid_pit)
             class_pit = np.concatenate(class_pit_arrays) if class_pit_arrays else np.array([], dtype=float)
             safe_class = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(class_label))
-            histogram_path = None
-            reliability_path = None
+            diagnostics_path = None
             if pit_output_dir is not None:
                 pit_dir = Path(pit_output_dir)
-                histogram_path = pit_dir / f"pit_histogram_{safe_class}.png"
-                reliability_path = pit_dir / f"pit_reliability_{safe_class}.png"
-            plot_pit_histogram(
+                diagnostics_path = pit_dir / f"pit_diagnostics_{safe_class}.png"
+            plot_pit_diagnostics(
                 class_pit,
-                title=f"PIT histogram: {class_label}",
+                title=f"PIT diagnostics: {class_label}",
                 bins=pit_bins,
-                save_path=histogram_path,
-            )
-            plot_pit_reliability_curve(
-                class_pit,
-                title=f"PIT reliability: {class_label}",
-                save_path=reliability_path,
+                save_path=diagnostics_path,
             )
 
         # Within-object z_std is unstable for very small n_test_object, so the filtered columns are included for interpretation.
