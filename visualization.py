@@ -350,3 +350,136 @@ def plot_multiband_gp_single_band_prediction(
         fig.savefig(output_path, bbox_inches="tight")
 
     return fig, ax
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def plot_feature_vs_metric_scatter(
+    df: pd.DataFrame,
+    feature_col: str,
+    metric_col: str,
+    *,
+    class_col: str | None = None,
+    alpha: float = 0.4,
+    add_trend: bool = True,
+    figsize: tuple[float, float] = (6, 4),
+):
+    """Scatter plot of one GP metric against one feature.
+
+    Each point is one row in df, usually one object-band GP evaluation.
+    """
+    if feature_col not in df or metric_col not in df:
+        raise KeyError(f"Missing {feature_col=} or {metric_col=}")
+
+    tmp = df[[feature_col, metric_col] + ([class_col] if class_col else [])].copy()
+    tmp[feature_col] = pd.to_numeric(tmp[feature_col], errors="coerce")
+    tmp[metric_col] = pd.to_numeric(tmp[metric_col], errors="coerce")
+    tmp = tmp.dropna(subset=[feature_col, metric_col])
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    if class_col is None:
+        ax.scatter(tmp[feature_col], tmp[metric_col], alpha=alpha)
+    else:
+        for cls, group in tmp.groupby(class_col):
+            ax.scatter(
+                group[feature_col],
+                group[metric_col],
+                alpha=alpha,
+                label=str(cls),
+            )
+        ax.legend(fontsize=8)
+
+    if add_trend and len(tmp) >= 3:
+        x = tmp[feature_col].to_numpy()
+        y = tmp[metric_col].to_numpy()
+
+        order = np.argsort(x)
+        x_sorted = x[order]
+        y_sorted = y[order]
+
+        # Rolling mean trend for visual guidance.
+        window = max(len(tmp) // 10, 5)
+        y_smooth = (
+            pd.Series(y_sorted)
+            .rolling(window=window, center=True, min_periods=max(window // 2, 1))
+            .mean()
+            .to_numpy()
+        )
+
+        ax.plot(x_sorted, y_smooth, linewidth=2)
+
+    if metric_col in {"z_error", "coverage_1sigma_error", "coverage_2sigma_error"}:
+        ax.axhline(0.0, linestyle="--", linewidth=1)
+
+    ax.set_xlabel(feature_col)
+    ax.set_ylabel(metric_col)
+    ax.set_title(f"{metric_col} vs {feature_col}")
+    ax.grid(True)
+    fig.tight_layout()
+
+    return fig, ax
+
+
+def plot_metric_by_feature_group(
+    summary: pd.DataFrame,
+    group_col: str,
+    feature_col: str,
+    metric_col: str,
+):
+    """Plot mean GP metric by feature group.
+
+    Parameters
+    ----------
+    summary:
+        Output from summarize_metrics_by_group.
+
+    group_col:
+        Group column, for example "total_variation_group".
+
+    feature_col:
+        Original feature column, for example "total_variation".
+
+    metric_col:
+        Metric column, for example "z_error", "nlpd", "ks_pit".
+
+    use_feature_mean:
+        If True, x-axis uses the mean feature value inside each group.
+        If False, x-axis uses group labels such as low/medium/high.
+
+    error:
+        "std", "se", or None.
+    """
+    y_col = f"{metric_col}_median"
+    q25_col = f"{metric_col}_q25"
+    q75_col = f"{metric_col}_q75"
+    x_col = f"{feature_col}_mean"
+
+    if x_col not in summary.columns:
+        raise KeyError(f"Missing feature mean column: {x_col}")
+    if y_col not in summary.columns:
+        raise KeyError(f"Missing metric median column: {y_col}")
+
+    x = summary[x_col]
+    y = summary[y_col]
+    yerr_lower = y - summary[q25_col]
+    yerr_upper = summary[q75_col] - y
+
+    plt.figure(figsize=(6, 4))
+    plt.errorbar(
+        x,
+        y,
+        yerr=[yerr_lower, yerr_upper],
+        marker="o",
+        capsize=3,
+    )
+
+    plt.xlabel(feature_col)
+    plt.ylabel(f"Median {metric_col} with IQR")
+    plt.title(f"{metric_col} by {group_col}")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
