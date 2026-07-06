@@ -16,6 +16,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.gaussian_process.kernels import ConstantKernel, Matern, RBF, WhiteKernel, Product, Sum
+
 
 
 EPS = 1e-12
@@ -43,6 +45,10 @@ LIGHTCURVE_ARRAY_COLUMNS = (
     "flux_err_train",
     "t_test",
     "flux_test",
+    "flux_pred_test",
+    "flux_pred_std_test",
+    "flux_pred_test_norm",
+    "flux_pred_std_test_norm",
 )
 
 
@@ -248,7 +254,7 @@ def extract_morphology_features(
         }
     )
 
-    baseline_mask = np.isfinite(t_aligned) & np.greater(np.abs(t_aligned), baseline_window)
+    baseline_mask = np.isfinite(t_aligned) & np.greater(np.abs(t_aligned), baseline_window)   # selects points far away from the peak
     baseline_flux = f[baseline_mask] if np.any(baseline_mask) else f
     features["baseline_level"] = _nan_stat(baseline_flux, np.median)
     features["baseline_std"] = _nan_stat(baseline_flux, np.std)
@@ -307,6 +313,9 @@ def extract_fluctuation_features(
     dt = np.diff(t)
     df = np.diff(f)
     valid_gap = np.greater(dt, 0)
+    # clip flux to avoid extreme values
+    q01, q99 = np.nanpercentile(f, [1, 99])
+    f = np.clip(f, q01, q99)
 
     if np.any(valid_gap):
         slopes = df[valid_gap] / dt[valid_gap]
@@ -589,6 +598,201 @@ def _scalar_metadata(data: dict[str, Any], *keys: str, default: Any = None) -> A
     return default
 
 
+def extract_kernel_hyperparameters(gp):
+    """
+    Extract fitted kernel hyperparameters from a fitted sklearn GaussianProcessRegressor.
+
+    This function is intended for diagnostics after GP fitting.
+    It does not use test labels.
+    """
+    features = {
+        "gp_length_scale": np.nan,
+        "gp_signal_variance": np.nan,
+        "gp_noise_level": np.nan,
+        "gp_log_marginal_likelihood": np.nan,
+        "gp_length_scale_at_lower_bound": False,
+        "gp_length_scale_at_upper_bound": False,
+    }
+
+    if gp is None or not hasattr(gp, "kernel_"):
+        return features
+
+    kernel = gp.kernel_
+
+    if hasattr(gp, "log_marginal_likelihood_value_"):
+        features["gp_log_marginal_likelihood"] = gp.log_marginal_likelihood_value_
+
+    def visit_kernel(k):
+        # Matern or RBF length scale
+        if isinstance(k, (Matern, RBF)):
+            length_scale_value = getattr(k, "length_scale", None)
+
+            if length_scale_value is not None:
+                length_scale = np.asarray(length_scale_value, dtype=float)
+
+                if length_scale.size == 1:
+                    features["gp_length_scale"] = float(length_scale.ravel()[0])
+                else:
+                    features["gp_length_scale_mean"] = float(np.mean(length_scale))
+                    features["gp_length_scale_min"] = float(np.min(length_scale))
+                    features["gp_length_scale_max"] = float(np.max(length_scale))
+
+        # ConstantKernel signal variance
+        if isinstance(k, ConstantKernel):
+            constant_value = getattr(k, "constant_value", None)
+
+            if constant_value is not None:
+                features["gp_signal_variance"] = float(constant_value)
+
+        # WhiteKernel noise level
+        if isinstance(k, WhiteKernel):
+            noise_level = getattr(k, "noise_level", None)
+
+            if noise_level is not None:
+                features["gp_noise_level"] = float(noise_level)
+
+        # Recursively visit product/sum kernels
+        if isinstance(k, (Product, Sum)):
+            k1 = getattr(k, "k1", None)
+            k2 = getattr(k, "k2", None)
+
+            if k1 is not None:
+                visit_kernel(k1)
+            if k2 is not None:
+                visit_kernel(k2)
+    visit_kernel(kernel)
+
+    return features
+
+
+def extract_predictive_uncertainty_features(
+    t_train,
+    t_test,
+    sigma_test,
+    *,
+    t_peak=None,
+    near_peak_window=50,
+):
+    """
+    Extract features from GP predictive standard deviation.
+
+    Uses test positions and GP predictive sigma, but not test labels.
+    """
+    features = {
+        "pred_sigma_mean": np.nan,
+        "pred_sigma_median": np.nan,
+        "pred_sigma_std": np.nan,
+        "pred_sigma_min": np.nan,
+        "pred_sigma_max": np.nan,
+        "pred_sigma_q90": np.nan,
+        "pred_sigma_near_peak_mean": np.nan,
+        "pred_sigma_off_peak_mean": np.nan,
+        "pred_sigma_outside_train_mean": np.nan,
+        "pred_sigma_inside_train_mean": np.nan,
+    }
+
+    t_train = np.asarray(t_train, dtype=float)
+    t_test = np.asarray(t_test, dtype=float)
+    sigma_test = np.asarray(sigma_test, dtype=float)
+
+    valid = np.isfinite(t_test) & np.isfinite(sigma_test)
+    t_test = t_test[valid]
+    sigma_test = sigma_test[valid]
+
+    if sigma_test.size == 0:
+        return features
+
+    features.update({
+        "pred_sigma_mean": float(np.mean(sigma_test)),
+        "pred_sigma_median": float(np.median(sigma_test)),
+        "pred_sigma_std": float(np.std(sigma_test)),
+        "pred_sigma_min": float(np.min(sigma_test)),
+        "pred_sigma_max": float(np.max(sigma_test)),
+        "pred_sigma_q90": float(np.percentile(sigma_test, 90)),
+    })
+
+    if t_peak is not None and np.isfinite(t_peak):
+        near_peak = np.abs(t_test - t_peak) <= near_peak_window
+        off_peak = ~near_peak
+
+        if np.any(near_peak):
+            features["pred_sigma_near_peak_mean"] = float(np.mean(sigma_test[near_peak]))
+        if np.any(off_peak):
+            features["pred_sigma_off_peak_mean"] = float(np.mean(sigma_test[off_peak]))
+
+    if t_train.size > 0 and np.any(np.isfinite(t_train)):
+        train_min = np.nanmin(t_train)
+        train_max = np.nanmax(t_train)
+
+        outside = (t_test < train_min) | (t_test > train_max)
+        inside = ~outside
+
+        if np.any(outside):
+            features["pred_sigma_outside_train_mean"] = float(np.mean(sigma_test[outside]))
+        if np.any(inside):
+            features["pred_sigma_inside_train_mean"] = float(np.mean(sigma_test[inside]))
+
+    return features
+
+
+def add_gp_distance_ratios(features):
+    result = dict(features)
+
+    ell = result.get("gp_length_scale", np.nan)
+
+    def safe_ratio(a, b):
+        if not np.isfinite(a) or not np.isfinite(b) or abs(b) < 1e-12:
+            return np.nan
+        return a / b
+
+    result["nearest_train_distance_over_length_scale_mean"] = safe_ratio(
+        result.get("nearest_train_distance_mean", np.nan), ell
+    )
+
+    result["nearest_train_distance_over_length_scale_90"] = safe_ratio(
+        result.get("nearest_train_distance_90", np.nan), ell
+    )
+
+    result["gap_90_over_length_scale"] = safe_ratio(
+        result.get("gap_90_train", np.nan), ell
+    )
+
+    return result
+
+
+def add_gp_lengthscale_ratios(features):
+    """
+    Add interpretable ratios between optimized GP length scale and data features.
+    Input and output are dictionaries.
+    """
+    result = dict(features)
+
+    ell = result.get("gp_length_scale", np.nan)
+
+    def safe_ratio(a, b):
+        if not np.isfinite(a) or not np.isfinite(b) or abs(b) < 1e-12:
+            return np.nan
+        return a / b
+
+    result["gp_length_scale_over_median_cadence"] = safe_ratio(
+        ell, result.get("median_train_cadence", np.nan)
+    )
+
+    result["gp_length_scale_over_gap_90"] = safe_ratio(
+        ell, result.get("gap_90_train", np.nan)
+    )
+
+    result["gp_length_scale_over_train_span"] = safe_ratio(
+        ell, result.get("train_time_span", np.nan)
+    )
+
+    result["gp_length_scale_over_width_50_pos"] = safe_ratio(
+        ell, result.get("width_50_pos", np.nan)
+    )
+
+    return result
+
+
 def _raw_observation_arrays_from_processed(data: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     """Return raw flux and raw flux errors from processed GP data.
 
@@ -656,6 +860,30 @@ def _metrics_for_feature_row(metrics: dict[str, Any] | None) -> FeatureDict:
     return metric_row
 
 
+def _prediction_arrays_for_record(metrics: dict[str, Any] | None) -> FeatureDict:
+    """Extract held-out prediction arrays from evaluate_heldout_metrics output."""
+    if metrics is None:
+        return {}
+
+    prediction_row: FeatureDict = {}
+    if "y_pred_raw" in metrics:
+        prediction_row["flux_pred_test"] = _as_float_array(metrics["y_pred_raw"])
+    elif "y_pred" in metrics:
+        prediction_row["flux_pred_test"] = _as_float_array(metrics["y_pred"])
+
+    if "y_std_raw" in metrics:
+        prediction_row["flux_pred_std_test"] = _as_float_array(metrics["y_std_raw"])
+    elif "y_std" in metrics:
+        prediction_row["flux_pred_std_test"] = _as_float_array(metrics["y_std"])
+
+    if "y_pred_norm" in metrics:
+        prediction_row["flux_pred_test_norm"] = _as_float_array(metrics["y_pred_norm"])
+    if "y_std_norm" in metrics:
+        prediction_row["flux_pred_std_test_norm"] = _as_float_array(metrics["y_std_norm"])
+
+    return prediction_row
+
+
 def make_feature_record_from_gp_split(
     train_data: dict[str, Any],
     heldout_data: dict[str, Any] | None = None,
@@ -701,6 +929,7 @@ def make_feature_record_from_gp_split(
     }
     if metrics is not None:
         record.update(_metrics_for_feature_row(metrics))
+        record.update(_prediction_arrays_for_record(metrics))   # add prediction arrays
     return record
 
 
@@ -903,6 +1132,10 @@ def get_object_band_lightcurve(
     flux_train = _as_float_array(row.get("flux_train"))
     t_test = _as_float_array(row.get("t_test"))
     flux_test = _as_float_array(row.get("flux_test"))
+    flux_pred_test = _as_float_array(row.get("flux_pred_test"))
+    flux_pred_std_test = _as_float_array(row.get("flux_pred_std_test"))
+    flux_pred_test_norm = _as_float_array(row.get("flux_pred_test_norm"))
+    flux_pred_std_test_norm = _as_float_array(row.get("flux_pred_std_test_norm"))
     flux_scale = robust_flux_scale(flux_all)
 
     result: FeatureDict = {
@@ -915,61 +1148,36 @@ def get_object_band_lightcurve(
         "flux_train": flux_train,
         "t_test": t_test,
         "flux_test": flux_test,
+        "flux_pred_test": flux_pred_test,
+        "flux_pred_std_test": flux_pred_std_test,
         "flux_scale": flux_scale,
         "time_space": row.get("time_space"),
     }
 
-    if normalize:
-        if np.isfinite(flux_scale) and flux_scale > EPS:
-            result["flux_all_norm"] = flux_all / flux_scale
-            result["flux_train_norm"] = flux_train / flux_scale
-            result["flux_test_norm"] = flux_test / flux_scale
-        else:
-            result["flux_all_norm"] = np.full(flux_all.shape, np.nan)
-            result["flux_train_norm"] = np.full(flux_train.shape, np.nan)
-            result["flux_test_norm"] = np.full(flux_test.shape, np.nan)
+    if np.isfinite(flux_scale) and flux_scale > EPS:
+        result["flux_all_norm"] = flux_all / flux_scale
+        result["flux_train_norm"] = flux_train / flux_scale
+        result["flux_test_norm"] = flux_test / flux_scale
+        if flux_pred_test.size > 0:
+            result["flux_pred_test_norm"] = (
+                flux_pred_test_norm if flux_pred_test_norm.size > 0 else flux_pred_test / flux_scale
+            )
+        if flux_pred_std_test.size > 0:
+            result["flux_pred_std_test_norm"] = (
+                flux_pred_std_test_norm
+                if flux_pred_std_test_norm.size > 0
+                else flux_pred_std_test / flux_scale
+            )
+    else:
+        result["flux_all_norm"] = np.full(flux_all.shape, np.nan)
+        result["flux_train_norm"] = np.full(flux_train.shape, np.nan)
+        result["flux_test_norm"] = np.full(flux_test.shape, np.nan)
+        if flux_pred_test.size > 0:
+            result["flux_pred_test_norm"] = np.full(flux_pred_test.shape, np.nan)
+        if flux_pred_std_test.size > 0:
+            result["flux_pred_std_test_norm"] = np.full(flux_pred_std_test.shape, np.nan)
 
     return result
-
-
-def plot_object_band_lightcurve(
-    records_or_lookup: Any,
-    object_id: Any,
-    band: Any,
-    *,
-    normalize: bool = False,
-    ax: Any = None,
-    figsize: tuple[float, float] = (8, 4),
-) -> Any:
-    """Plot complete, training, and held-out points for one object and band."""
-    curve = get_object_band_lightcurve(
-        records_or_lookup,
-        object_id,
-        band,
-        normalize=normalize,
-    )
-
-    if ax is None:
-        import matplotlib.pyplot as plt
-
-        _, ax = plt.subplots(figsize=figsize)
-
-    flux_key = "flux_all_norm" if normalize else "flux_all"
-    train_key = "flux_train_norm" if normalize else "flux_train"
-    test_key = "flux_test_norm" if normalize else "flux_test"
-
-    ax.scatter(curve["t_all"], curve[flux_key], color="0.75", s=28, label="all")
-    ax.scatter(curve["t_train"], curve[train_key], color="tab:blue", s=42, label="train")
-    if len(curve["t_test"]) > 0:
-        ax.scatter(curve["t_test"], curve[test_key], color="tab:orange", s=48, label="held-out")
-
-    ylabel = "normalized flux" if normalize else "flux"
-    title = f"object_id={curve['object_id']}, band={curve['band']}"
-    ax.set_title(title)
-    ax.set_xlabel(f"time ({curve.get('time_space') or 'stored'})")
-    ax.set_ylabel(ylabel)
-    ax.legend()
-    return ax
 
 
 def save_feature_table_csv(

@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from typing import Any
 
 from MOGP_model import DEFAULT_BAND_TO_WAVELENGTH, _resolve_wavelength
 
@@ -483,3 +484,55 @@ def plot_metric_by_feature_group(
     plt.grid(True)
     plt.tight_layout()
     plt.show()
+
+
+def plot_object_band_lightcurve(
+    curve,
+    *,
+    normalize: bool = False,
+    show_predictions: bool = True,
+    ax: Any = None,
+    figsize: tuple[float, float] = (8, 4),
+) -> Any:
+    """Plot complete, training, and held-out points for one object and band."""
+
+    if ax is None:
+        import matplotlib.pyplot as plt
+
+        _, ax = plt.subplots(figsize=figsize)
+
+    flux_key = "flux_all_norm" if normalize else "flux_all"
+    train_key = "flux_train_norm" if normalize else "flux_train"
+    test_key = "flux_test_norm" if normalize else "flux_test"
+
+    ax.scatter(curve["t_all"], curve[flux_key], color="0.75", s=28, label="all")
+    ax.scatter(curve["t_train"], curve[train_key], color="tab:blue", s=42, label="train")
+    if len(curve["t_test"]) > 0:
+        ax.scatter(curve["t_test"], curve[test_key], color="tab:orange", s=48, label="held-out")
+
+    pred_key = "flux_pred_test_norm" if normalize else "flux_pred_test"
+    pred_std_key = "flux_pred_std_test_norm" if normalize else "flux_pred_std_test"
+    if show_predictions and len(curve["t_test"]) > 0 and len(curve.get(pred_key, [])) > 0:
+        order = np.argsort(curve["t_test"])
+        t_pred = curve["t_test"][order]
+        y_pred = curve[pred_key][order]
+        ax.plot(t_pred, y_pred, color="tab:red", linewidth=2, marker="o", markersize=4, label="GP prediction")
+        if len(curve.get(pred_std_key, [])) == len(curve[pred_key]):
+            y_std = curve[pred_std_key][order]
+            ax.fill_between(
+                t_pred,
+                y_pred - y_std,
+                y_pred + y_std,
+                color="tab:red",
+                alpha=0.18,
+                linewidth=0,
+                label="GP prediction +/-1 sigma",
+            )
+
+    ylabel = "normalized flux" if normalize else "flux"
+    title = f"object_id={curve['object_id']}, band={curve['band']}"
+    ax.set_title(title)
+    ax.set_xlabel(f"time ({curve.get('time_space') or 'stored'})")
+    ax.set_ylabel(ylabel)
+    ax.legend()
+    return ax
