@@ -13,6 +13,13 @@ from evaluation_metrics import (
     summarize_single_band_gp_class_metrics,
     yerr_statistics,
 )
+from gp_internal_diagnostics import (
+    compute_gp_internal_diagnostics,
+    plot_rmse_vs_sigma_by_class,
+    plot_rmse_vs_sigma_colored_by_zerror,
+    prediction_dataframe_from_results,
+    run_gp_internal_diagnostic_analysis,
+)
 from singleGP_model import (
     extract_basic_gp_features,
     fit_basic_gp,

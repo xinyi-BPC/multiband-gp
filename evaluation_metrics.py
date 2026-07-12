@@ -446,6 +446,13 @@ def evaluate_heldout_metrics(
     t_test = np.asarray(heldout_data["t"])
     band = heldout_data.get("band", None)
     obj_id = heldout_data.get("obj_id", None)
+    obj_type = None
+    for source in (heldout_data, train_data, object_data):
+        if isinstance(source, Mapping):
+            obj_type = source.get("obj_type", source.get("class", None))
+            if obj_type is not None:
+                obj_type = _scalar_from_result_value(obj_type)
+                break
 
     if train_data is not None:
         train_t = np.asarray(train_data["t"])
@@ -519,6 +526,7 @@ def evaluate_heldout_metrics(
         "time": t_test,
         "X_test": np.asarray(heldout_data["X"]).reshape(n_heldout, -1),
         "object_id": np.repeat(obj_id, n_heldout),
+        "obj_type": np.repeat(obj_type, n_heldout),
         "band": np.repeat(band, n_heldout),
         "outside_train_range": outside_train_range,
         "distance_to_train_range": distance_to_train_range,

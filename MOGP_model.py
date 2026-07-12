@@ -1206,6 +1206,7 @@ def run_target_band_ablation_study(
         "gp": real_gp,
         "train_data": real_train_m,
         "heldout_data": target_heldout_m,
+        "metrics": real_metrics,
         "aux_selected_indices_by_band": aux_selected_indices_by_band,
     }
 
@@ -1236,6 +1237,7 @@ def run_target_band_ablation_study(
         "gp": independent_gp,
         "train_data": real_train_m,
         "heldout_data": target_heldout_m,
+        "metrics": independent_metrics,
     }
 
     # E. Same points as C, shuffled non-target wavelengths.
@@ -1328,6 +1330,7 @@ def run_target_band_ablation_study(
 
     return {
         "object_id": example["object_id"],
+        "class": example["obj_type"],
         "target_band": target_band,
         "target_heldout_indices": expected_heldout,
         "aux_band_ratios": aux_band_ratios,
