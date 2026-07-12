@@ -42,6 +42,15 @@ DEFAULT_BAND_TO_WAVELENGTH = {
     4: 869.1,
 }
 
+DEFAULT_ABLATION_MODELS = (
+    "single_band_gp",
+    "mogp_target_only",
+    "mogp_real_wavelength",
+    "mogp_independent_band_control",
+    "mogp_shuffled_wavelength_control",
+    "same_total_train_budget_existing",
+)
+
 
 def _resolve_wavelength(band, band_to_wavelength):
     """Resolve a band's configured effective wavelength."""
@@ -1017,6 +1026,7 @@ def run_target_band_ablation_study(
         single_gp_kwargs=None,
         mogp_gp_kwargs=None,
         output_csv_path=None,
+        models=DEFAULT_ABLATION_MODELS,
 ):
     """
     Run target-band ablations separating training-set size from cross-band covariance.
@@ -1026,11 +1036,27 @@ def run_target_band_ablation_study(
     Model D is implemented as the small-wavelength-length-scale control, which
     approximates a block-diagonal independent-band kernel for well-separated
     band wavelengths.
+
+    ``models`` may select any subset of ``DEFAULT_ABLATION_MODELS``. Its default
+    preserves the original behavior and runs every model.
     """
     band_to_wavelength = band_to_wavelength or DEFAULT_BAND_TO_WAVELENGTH
     aux_band_ratios = aux_band_ratios or {}
     single_gp_kwargs = single_gp_kwargs or {}
     mogp_gp_kwargs = mogp_gp_kwargs or {}
+    if isinstance(models, str):
+        models = (models,)
+    models = set(DEFAULT_ABLATION_MODELS if models is None else models)
+    unknown_models = models - set(DEFAULT_ABLATION_MODELS)
+    if unknown_models:
+        raise ValueError(
+            f"Unknown ablation models: {sorted(unknown_models)}. "
+            f"Choose from {list(DEFAULT_ABLATION_MODELS)}."
+        )
+    if not include_same_total_train_budget:
+        models.discard("same_total_train_budget_existing")
+    if not models:
+        raise ValueError("models must select at least one ablation model.")
     rng = np.random.default_rng(random_state)
     object_flux_scale = object_level_empirical_flux_scale(
         example=example,
@@ -1121,60 +1147,62 @@ def run_target_band_ablation_study(
     artifacts = {}
 
     # A. Existing single-band GP.
-    single_gp = fit_basic_gp(target_train_s, kernel_type="matern", **single_gp_kwargs)
-    single_metrics = evaluate_heldout_metrics(
-        single_gp,
-        target_heldout_s,
-        train_data=target_train_s,
-        object_data=example,
-        object_flux_scale=object_flux_scale,
-        nrmse_quantile=nrmse_quantile,
-        nrmse_epsilon=nrmse_epsilon,
-    )
-    rows.append(_metrics_row_from_result(
-        "single_band_gp",
-        single_metrics,
-        target_train_s,
-        target_band,
-        target_heldout_s["heldout_indices"],
-    ))
-    artifacts["single_band_gp"] = {
-        "gp": single_gp,
-        "train_data": target_train_s,
-        "heldout_data": target_heldout_s,
-    }
+    if "single_band_gp" in models:
+        single_gp = fit_basic_gp(target_train_s, kernel_type="matern", **single_gp_kwargs)
+        single_metrics = evaluate_heldout_metrics(
+            single_gp,
+            target_heldout_s,
+            train_data=target_train_s,
+            object_data=example,
+            object_flux_scale=object_flux_scale,
+            nrmse_quantile=nrmse_quantile,
+            nrmse_epsilon=nrmse_epsilon,
+        )
+        rows.append(_metrics_row_from_result(
+            "single_band_gp",
+            single_metrics,
+            target_train_s,
+            target_band,
+            target_heldout_s["heldout_indices"],
+        ))
+        artifacts["single_band_gp"] = {
+            "gp": single_gp,
+            "train_data": target_train_s,
+            "heldout_data": target_heldout_s,
+        }
 
     # B. MOGP target-only, fixed wavelength.
-    target_only_train_m = _build_mogp_data_from_raw_rows(
-        example,
-        target_train_rows,
-        target_train_s,
-        band_to_wavelength,
-    )
-    if target_only_train_m is None:
-        raise ValueError("Could not build MOGP target-only training data.")
-    target_only_gp = fit_mogp_gp(target_only_train_m, **mogp_gp_kwargs)
-    target_only_metrics = _evaluate_mogp_on_target_heldout(
-        target_only_gp,
-        target_heldout_m,
-        target_only_train_m,
-        object_data=example,
-        object_flux_scale=object_flux_scale,
-        nrmse_quantile=nrmse_quantile,
-        nrmse_epsilon=nrmse_epsilon,
-    )
-    rows.append(_metrics_row_from_result(
-        "mogp_target_only",
-        target_only_metrics,
-        target_only_train_m,
-        target_band,
-        target_heldout_s["heldout_indices"],
-    ))
-    artifacts["mogp_target_only"] = {
-        "gp": target_only_gp,
-        "train_data": target_only_train_m,
-        "heldout_data": target_heldout_m,
-    }
+    if "mogp_target_only" in models:
+        target_only_train_m = _build_mogp_data_from_raw_rows(
+            example,
+            target_train_rows,
+            target_train_s,
+            band_to_wavelength,
+        )
+        if target_only_train_m is None:
+            raise ValueError("Could not build MOGP target-only training data.")
+        target_only_gp = fit_mogp_gp(target_only_train_m, **mogp_gp_kwargs)
+        target_only_metrics = _evaluate_mogp_on_target_heldout(
+            target_only_gp,
+            target_heldout_m,
+            target_only_train_m,
+            object_data=example,
+            object_flux_scale=object_flux_scale,
+            nrmse_quantile=nrmse_quantile,
+            nrmse_epsilon=nrmse_epsilon,
+        )
+        rows.append(_metrics_row_from_result(
+            "mogp_target_only",
+            target_only_metrics,
+            target_only_train_m,
+            target_band,
+            target_heldout_s["heldout_indices"],
+        ))
+        artifacts["mogp_target_only"] = {
+            "gp": target_only_gp,
+            "train_data": target_only_train_m,
+            "heldout_data": target_heldout_m,
+        }
 
     # C. Real wavelengths with selected auxiliary bands.
     real_train_m = _build_mogp_data_from_raw_rows(
@@ -1185,100 +1213,103 @@ def run_target_band_ablation_study(
     )
     if real_train_m is None:
         raise ValueError("Could not build MOGP real-wavelength training data.")
-    real_gp = fit_mogp_gp(real_train_m, **mogp_gp_kwargs)
-    real_metrics = _evaluate_mogp_on_target_heldout(
-        real_gp,
-        target_heldout_m,
-        real_train_m,
-        object_data=example,
-        object_flux_scale=object_flux_scale,
-        nrmse_quantile=nrmse_quantile,
-        nrmse_epsilon=nrmse_epsilon,
-    )
-    rows.append(_metrics_row_from_result(
-        "mogp_real_wavelength",
-        real_metrics,
-        real_train_m,
-        target_band,
-        target_heldout_s["heldout_indices"],
-    ))
-    artifacts["mogp_real_wavelength"] = {
-        "gp": real_gp,
-        "train_data": real_train_m,
-        "heldout_data": target_heldout_m,
-        "metrics": real_metrics,
-        "aux_selected_indices_by_band": aux_selected_indices_by_band,
-    }
-
-    # D. Same points as C, approximate independent-band control.
-    independent_kwargs = dict(mogp_gp_kwargs)
-    independent_kwargs.setdefault("wavelength_length_scale", 1e-6)
-    independent_kwargs.setdefault("wavelength_length_scale_bounds", (1e-6, 1e-6))
-    independent_kwargs.setdefault("n_restarts_optimizer", 0)
-    independent_gp = fit_mogp_gp(real_train_m, **independent_kwargs)
-    independent_metrics = _evaluate_mogp_on_target_heldout(
-        independent_gp,
-        target_heldout_m,
-        real_train_m,
-        object_data=example,
-        object_flux_scale=object_flux_scale,
-        nrmse_quantile=nrmse_quantile,
-        nrmse_epsilon=nrmse_epsilon,
-    )
-    rows.append(_metrics_row_from_result(
-        "mogp_independent_band_control",
-        independent_metrics,
-        real_train_m,
-        target_band,
-        target_heldout_s["heldout_indices"],
-        notes="Approximate independent-band control: wavelength length scale set near zero.",
-    ))
-    artifacts["mogp_independent_band_control"] = {
-        "gp": independent_gp,
-        "train_data": real_train_m,
-        "heldout_data": target_heldout_m,
-        "metrics": independent_metrics,
-    }
-
-    # E. Same points as C, shuffled non-target wavelengths.
-    shuffled_rows = []
-    non_target_mask = ~_band_equal_mask(real_train_m["band"], target_band)
-    non_target_wavelengths = np.asarray(real_train_m["wavelength"], dtype=float)[non_target_mask]
-    for repeat_idx in range(shuffle_repeats):
-        shuffled_wavelengths = np.asarray(real_train_m["wavelength"], dtype=float).copy()
-        if len(non_target_wavelengths) > 1:
-            shuffled_wavelengths[non_target_mask] = rng.permutation(non_target_wavelengths)
-        shuffled_train_m = real_train_m.copy()
-        shuffled_train_m["wavelength"] = shuffled_wavelengths
-        shuffled_train_m["X"] = np.column_stack([shuffled_train_m["t"], shuffled_wavelengths])
-        shuffled_gp = fit_mogp_gp(shuffled_train_m, **mogp_gp_kwargs)
-        shuffled_metrics = _evaluate_mogp_on_target_heldout(
-            shuffled_gp,
+    if "mogp_real_wavelength" in models:
+        real_gp = fit_mogp_gp(real_train_m, **mogp_gp_kwargs)
+        real_metrics = _evaluate_mogp_on_target_heldout(
+            real_gp,
             target_heldout_m,
-            shuffled_train_m,
+            real_train_m,
             object_data=example,
             object_flux_scale=object_flux_scale,
             nrmse_quantile=nrmse_quantile,
             nrmse_epsilon=nrmse_epsilon,
         )
-        shuffled_row = _metrics_row_from_result(
-            f"mogp_shuffled_wavelength_control_seed{repeat_idx}",
-            shuffled_metrics,
-            shuffled_train_m,
+        rows.append(_metrics_row_from_result(
+            "mogp_real_wavelength",
+            real_metrics,
+            real_train_m,
             target_band,
             target_heldout_s["heldout_indices"],
-        )
-        shuffled_row["shuffle_repeat"] = repeat_idx
-        rows.append(shuffled_row)
-        shuffled_rows.append({
-            "gp": shuffled_gp,
-            "train_data": shuffled_train_m,
+        ))
+        artifacts["mogp_real_wavelength"] = {
+            "gp": real_gp,
+            "train_data": real_train_m,
             "heldout_data": target_heldout_m,
-        })
-    artifacts["mogp_shuffled_wavelength_control"] = shuffled_rows
+            "metrics": real_metrics,
+            "aux_selected_indices_by_band": aux_selected_indices_by_band,
+        }
+
+    # D. Same points as C, approximate independent-band control.
+    if "mogp_independent_band_control" in models:
+        independent_kwargs = dict(mogp_gp_kwargs)
+        independent_kwargs.setdefault("wavelength_length_scale", 1e-6)
+        independent_kwargs.setdefault("wavelength_length_scale_bounds", (1e-6, 1e-6))
+        independent_kwargs.setdefault("n_restarts_optimizer", 0)
+        independent_gp = fit_mogp_gp(real_train_m, **independent_kwargs)
+        independent_metrics = _evaluate_mogp_on_target_heldout(
+            independent_gp,
+            target_heldout_m,
+            real_train_m,
+            object_data=example,
+            object_flux_scale=object_flux_scale,
+            nrmse_quantile=nrmse_quantile,
+            nrmse_epsilon=nrmse_epsilon,
+        )
+        rows.append(_metrics_row_from_result(
+            "mogp_independent_band_control",
+            independent_metrics,
+            real_train_m,
+            target_band,
+            target_heldout_s["heldout_indices"],
+            notes="Approximate independent-band control: wavelength length scale set near zero.",
+        ))
+        artifacts["mogp_independent_band_control"] = {
+            "gp": independent_gp,
+            "train_data": real_train_m,
+            "heldout_data": target_heldout_m,
+            "metrics": independent_metrics,
+        }
+
+    # E. Same points as C, shuffled non-target wavelengths.
+    if "mogp_shuffled_wavelength_control" in models:
+        shuffled_rows = []
+        non_target_mask = ~_band_equal_mask(real_train_m["band"], target_band)
+        non_target_wavelengths = np.asarray(real_train_m["wavelength"], dtype=float)[non_target_mask]
+        for repeat_idx in range(shuffle_repeats):
+            shuffled_wavelengths = np.asarray(real_train_m["wavelength"], dtype=float).copy()
+            if len(non_target_wavelengths) > 1:
+                shuffled_wavelengths[non_target_mask] = rng.permutation(non_target_wavelengths)
+            shuffled_train_m = real_train_m.copy()
+            shuffled_train_m["wavelength"] = shuffled_wavelengths
+            shuffled_train_m["X"] = np.column_stack([shuffled_train_m["t"], shuffled_wavelengths])
+            shuffled_gp = fit_mogp_gp(shuffled_train_m, **mogp_gp_kwargs)
+            shuffled_metrics = _evaluate_mogp_on_target_heldout(
+                shuffled_gp,
+                target_heldout_m,
+                shuffled_train_m,
+                object_data=example,
+                object_flux_scale=object_flux_scale,
+                nrmse_quantile=nrmse_quantile,
+                nrmse_epsilon=nrmse_epsilon,
+            )
+            shuffled_row = _metrics_row_from_result(
+                f"mogp_shuffled_wavelength_control_seed{repeat_idx}",
+                shuffled_metrics,
+                shuffled_train_m,
+                target_band,
+                target_heldout_s["heldout_indices"],
+            )
+            shuffled_row["shuffle_repeat"] = repeat_idx
+            rows.append(shuffled_row)
+            shuffled_rows.append({
+                "gp": shuffled_gp,
+                "train_data": shuffled_train_m,
+                "heldout_data": target_heldout_m,
+            })
+        artifacts["mogp_shuffled_wavelength_control"] = shuffled_rows
 
     # F. Existing fixed-total-budget comparison: N total rows sampled from all bands.
-    if include_same_total_train_budget:
+    if "same_total_train_budget_existing" in models:
         all_train_groups = [target_train_rows] + [
             _raw_rows_from_split(split, split["train_indices"])
             for split in aux_splits.values()
@@ -1334,6 +1365,7 @@ def run_target_band_ablation_study(
         "target_band": target_band,
         "target_heldout_indices": expected_heldout,
         "aux_band_ratios": aux_band_ratios,
+        "models": tuple(model for model in DEFAULT_ABLATION_MODELS if model in models),
         "rows": rows,
         "artifacts": artifacts,
     }

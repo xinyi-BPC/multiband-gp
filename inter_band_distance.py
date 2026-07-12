@@ -279,6 +279,12 @@ def compute_wavelength_compatibility(distances, band_to_wavelength=None):
 
 
 def _ablation_metrics(result, model_name):
+    if model_name not in result.get("artifacts", {}):
+        raise ValueError(
+            f"Ablation result for object {result.get('object_id')!r} does not contain "
+            f"{model_name!r}. Run with models=('mogp_real_wavelength', "
+            "'mogp_independent_band_control')."
+        )
     artifact = result["artifacts"][model_name]
     if "metrics" in artifact:
         return artifact["metrics"]
@@ -407,6 +413,238 @@ def aggregate_mogp_vs_model_d(pointwise):
     return objects, pd.DataFrame(class_rows)
 
 
+def compute_band_pair_transfer_analysis(
+        ablation_results, distances, transfer_pairs, support_window=0.25):
+    """Compute class D, effective support, and NLPD gain per aux->target pair.
+
+    Effective support is first averaged over held-out target times within each
+    object, then summarized by the class median so dense objects do not dominate.
+    Each result must have exactly one active auxiliary band for attribution.
+    """
+    if not isinstance(distances, pd.DataFrame):
+        distances = pd.read_csv(distances)
+    transfer_pairs = [tuple(pair) for pair in transfer_pairs]
+    if any(len(pair) != 2 for pair in transfer_pairs):
+        raise ValueError("Each transfer pair must be (auxiliary_band, target_band).")
+
+    object_rows = []
+    observed_configurations = set()
+    for result in ablation_results:
+        target_band = result.get("target_band")
+        active_aux = tuple(
+            str(band) for band, ratio in result.get("aux_band_ratios", {}).items()
+            if float(ratio) > 0
+        )
+        observed_configurations.add((str(target_band), active_aux))
+        matching_pairs = [
+            (aux, target) for aux, target in transfer_pairs
+            if str(target) == str(target_band)
+        ]
+        if not matching_pairs:
+            continue
+        active_aux = [
+            band for band, ratio in result.get("aux_band_ratios", {}).items()
+            if float(ratio) > 0
+        ]
+        if len(active_aux) != 1:
+            raise ValueError(
+                f"Object {result.get('object_id')!r}, target {target_band!r} has "
+                f"{len(active_aux)} active auxiliary bands ({active_aux}); pair-specific "
+                "gain requires exactly one."
+            )
+        aux_band = active_aux[0]
+        if not any(str(aux) == str(aux_band) for aux, _ in matching_pairs):
+            continue
+
+        pointwise = build_mogp_vs_model_d_pointwise([result])
+        artifact = result["artifacts"]["mogp_real_wavelength"]
+        train_data = artifact["train_data"]
+        heldout_data = artifact["heldout_data"]
+        train_band = np.asarray(train_data["band"], dtype=object)
+        aux_times = np.asarray(train_data["t"], dtype=float)[
+            np.asarray([str(value) == str(aux_band) for value in train_band])
+        ]
+        target_times = np.asarray(heldout_data["t"], dtype=float)
+        support = (
+            float(np.mean([
+                np.sum(np.abs(aux_times - time) <= support_window)
+                for time in target_times
+            ]))
+            if len(target_times) else np.nan
+        )
+        error_mogp = pointwise["y_true"] - pointwise["mu_mogp"]
+        error_model_d = pointwise["y_true"] - pointwise["mu_model_d"]
+        rmse_mogp = float(np.sqrt(np.mean(error_mogp ** 2)))
+        rmse_model_d = float(np.sqrt(np.mean(error_model_d ** 2)))
+        object_rows.append({
+            "object_id": result["object_id"],
+            "class": result.get("class", heldout_data.get("obj_type", np.nan)),
+            "auxiliary_band": aux_band,
+            "target_band": target_band,
+            "effective_aux_support_object": support,
+            "delta_nlpd_object": pointwise["delta_nlpd"].mean(),
+            "delta_sharp_object": pointwise["delta_sharp"].mean(),
+            "delta_std_error_object": pointwise["delta_std_error"].mean(),
+            "delta_squared_error_object": pointwise["delta_squared_error"].mean(),
+            "rmse_mogp_object": rmse_mogp,
+            "rmse_model_d_object": rmse_model_d,
+            "delta_rmse_object": rmse_model_d - rmse_mogp,
+            "n_test_points": len(pointwise),
+        })
+    if not object_rows:
+        requested = [f"{aux}->{target}" for aux, target in transfer_pairs]
+        observed = [
+            f"{','.join(aux) if aux else '(none)'}->{target}"
+            for target, aux in sorted(observed_configurations)
+        ]
+        raise ValueError(
+            f"No ablation results matched requested transfer pairs {requested}. "
+            f"Observed active-auxiliary->target configurations: {observed}. "
+            "Rerun the ablation with the requested target_band and exactly one "
+            "positive aux_band_ratios entry."
+        )
+    object_pairs = pd.DataFrame(object_rows)
+
+    rows = []
+    for (class_label, aux_band, target_band), group in object_pairs.groupby(
+            ["class", "auxiliary_band", "target_band"], sort=False, dropna=False):
+        pair_mask = (
+            ((distances["band_1"].astype(str) == str(aux_band))
+             & (distances["band_2"].astype(str) == str(target_band)))
+            | ((distances["band_1"].astype(str) == str(target_band))
+               & (distances["band_2"].astype(str) == str(aux_band)))
+        ) & (distances["class"].astype(str) == str(class_label))
+        pair_distance = distances.loc[pair_mask, "d_total"]
+        if len(pair_distance) != 1:
+            raise ValueError(
+                f"Expected one D_total row for class {class_label!r} and pair "
+                f"{aux_band!r}->{target_band!r}; found {len(pair_distance)}."
+            )
+        delta = group["delta_nlpd_object"]
+        rows.append({
+            "class": class_label,
+            "auxiliary_band": aux_band,
+            "target_band": target_band,
+            "d_total_pair": float(pair_distance.iloc[0]),
+            "effective_aux_support": group["effective_aux_support_object"].median(),
+            "median_delta_nlpd": delta.median(),
+            "mean_delta_nlpd": delta.mean(),
+            "q25_delta_nlpd": delta.quantile(0.25),
+            "q75_delta_nlpd": delta.quantile(0.75),
+            "median_delta_sharp": group["delta_sharp_object"].median(),
+            "median_delta_std_error": group["delta_std_error_object"].median(),
+            "median_delta_squared_error": group["delta_squared_error_object"].median(),
+            "median_delta_rmse": group["delta_rmse_object"].median(),
+            "fraction_improved_nlpd": (delta > 0).mean(),
+            "fraction_improved_rmse": (group["delta_rmse_object"] > 0).mean(),
+            "n_objects": group["object_id"].nunique(),
+            "total_test_points": int(group["n_test_points"].sum()),
+            "support_window": float(support_window),
+        })
+    return object_pairs, pd.DataFrame(rows)
+
+
+def _plot_band_pair_transfer(pair_summary, output_dir):
+    pairs = list(pair_summary[["auxiliary_band", "target_band"]]
+                 .drop_duplicates().itertuples(index=False, name=None))
+    fig, axes = plt.subplots(
+        len(pairs), 2, figsize=(11, 4.5 * len(pairs)), squeeze=False,
+        layout="constrained",
+    )
+    for row_index, (aux_band, target_band) in enumerate(pairs):
+        group = pair_summary[
+            (pair_summary["auxiliary_band"].astype(str) == str(aux_band))
+            & (pair_summary["target_band"].astype(str) == str(target_band))
+        ]
+        for ax, x_column, xlabel in [
+            (axes[row_index, 0], "d_total_pair", f"D_total ({aux_band}, {target_band})"),
+            (axes[row_index, 1], "effective_aux_support",
+             f"Effective support ({aux_band} → {target_band})"),
+        ]:
+            ax.scatter(group[x_column], group["median_delta_nlpd"])
+            for item in group.itertuples(index=False):
+                ax.annotate(str(item[0]), (getattr(item, x_column), item.median_delta_nlpd),
+                            xytext=(4, 4), textcoords="offset points", fontsize=8)
+            ax.axhline(0, color="grey", linewidth=1)
+            ax.set(xlabel=xlabel, ylabel="Median NLPD gain: Model D − MOGP",
+                   title=f"{aux_band} → {target_band}")
+            ax.grid(alpha=0.2)
+    fig.savefig(output_dir / "band_pair_distance_support_vs_nlpd_gain.png", dpi=160)
+    plt.close(fig)
+
+    gain_fig, gain_axes = plt.subplots(
+        len(pairs), 1, figsize=(max(8, 0.7 * pair_summary["class"].nunique()),
+                               4.5 * len(pairs)),
+        squeeze=False, layout="constrained",
+    )
+    decomposition_fig, decomposition_axes = plt.subplots(
+        len(pairs), 1, figsize=(max(8, 0.8 * pair_summary["class"].nunique()),
+                               4.5 * len(pairs)),
+        squeeze=False, layout="constrained",
+    )
+    for row_index, (aux_band, target_band) in enumerate(pairs):
+        group = pair_summary[
+            (pair_summary["auxiliary_band"].astype(str) == str(aux_band))
+            & (pair_summary["target_band"].astype(str) == str(target_band))
+        ].sort_values("median_delta_nlpd")
+        x = np.arange(len(group))
+        lower = group["median_delta_nlpd"] - group["q25_delta_nlpd"]
+        upper = group["q75_delta_nlpd"] - group["median_delta_nlpd"]
+
+        ax = gain_axes[row_index, 0]
+        ax.errorbar(x, group["median_delta_nlpd"], yerr=[lower, upper],
+                    fmt="o", capsize=3)
+        ax.axhline(0, color="grey", linewidth=1)
+        ax.set(xticks=x, xticklabels=group["class"],
+               ylabel="NLPD gain: Model D − MOGP",
+               title=f"Class-level NLPD gain: {aux_band} → {target_band}")
+        ax.tick_params(axis="x", rotation=45)
+
+        ax = decomposition_axes[row_index, 0]
+        width = 0.38
+        ax.bar(x - width / 2, group["median_delta_sharp"], width, label="Sharpness")
+        ax.bar(x + width / 2, group["median_delta_std_error"], width,
+               label="Standardized error")
+        ax.plot(x, group["median_delta_nlpd"], "ko", label="Total NLPD gain")
+        ax.axhline(0, color="grey", linewidth=1)
+        ax.set(xticks=x, xticklabels=group["class"], ylabel="Median contribution",
+               title=f"NLPD decomposition: {aux_band} → {target_band}")
+        ax.tick_params(axis="x", rotation=45)
+        ax.legend()
+    gain_fig.savefig(output_dir / "band_pair_class_nlpd_gain.png", dpi=160)
+    decomposition_fig.savefig(
+        output_dir / "band_pair_class_nlpd_decomposition.png", dpi=160
+    )
+    plt.close(gain_fig)
+    plt.close(decomposition_fig)
+
+
+def run_band_pair_transfer_analysis(
+        ablation_results, transfer_pairs,
+        distances="inter_band_distance_outputs/inter_band_distances.csv",
+        output_dir="inter_band_distance_outputs", support_window=0.25):
+    """Save the complete pair-specific MOGP-gain analysis and figures.
+
+    This workflow intentionally uses D_total for each requested band pair; it
+    does not use the across-pair wavelength-compatibility Spearman statistic.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    object_pairs, pair_summary = compute_band_pair_transfer_analysis(
+        ablation_results, distances, transfer_pairs, support_window=support_window
+    )
+    object_pairs.to_csv(output_dir / "object_level_band_pair_transfer.csv", index=False)
+    pair_summary.to_csv(output_dir / "class_level_band_pair_transfer.csv", index=False)
+    _plot_band_pair_transfer(pair_summary, output_dir)
+    for row in pair_summary.itertuples(index=False):
+        print(
+            f"{row[0]} {row.auxiliary_band}->{row.target_band}: "
+            f"D={row.d_total_pair:.10g}, support={row.effective_aux_support:.10g}, "
+            f"median_delta_nlpd={row.median_delta_nlpd:.10g}"
+        )
+    return object_pairs, pair_summary
+
+
 def _plot_compatibility_and_gain(summary, output_dir):
     fig, ax = plt.subplots(figsize=(7, 5), layout="constrained")
     ax.scatter(summary["compatibility_spearman_rho"], summary["median_delta_nlpd"])
@@ -473,8 +711,37 @@ def run_compatibility_vs_mogp_gain_analysis(
     _plot_compatibility_and_gain(summary, output_dir)
     for row in summary.itertuples(index=False):
         print(
-            f"{row[0]}: compatibility_rho={row.compatibility_spearman_rho:.3g}, "
-            f"median_delta_nlpd={row.median_delta_nlpd:.3g}, "
-            f"median_delta_sharp={row.median_delta_sharp:.3g}"
+            f"{row[0]}: compatibility_rho={row.compatibility_spearman_rho:.10g}, "
+            f"median_delta_nlpd={row.median_delta_nlpd:.10g}, "
+            f"median_delta_sharp={row.median_delta_sharp:.10g}, "
+            f"median_delta_std_error={row.median_delta_std_error:.10g}"
         )
     return pointwise, objects, summary
+
+
+def print_class_gain_diagnostics(
+        object_results, class_summary=None, class_label="M-dwarf", precision=12):
+    """Print object distributions, missing counts, and exact class-level values."""
+    object_columns = [
+        "delta_nlpd_object", "delta_sharp_object",
+        "delta_std_error_object", "delta_rmse_object",
+    ]
+    missing_columns = [
+        "delta_nlpd_object", "delta_sharp_object", "delta_std_error_object",
+    ]
+    missing = [name for name in ["class", *object_columns] if name not in object_results]
+    if missing:
+        raise ValueError(f"object_results is missing required columns: {missing}")
+    selected = object_results[object_results["class"] == class_label]
+    if selected.empty:
+        raise ValueError(f"No object-level rows found for class {class_label!r}.")
+
+    with pd.option_context("display.precision", precision):
+        print(selected[object_columns].describe())
+        print("\nMissing values:")
+        print(selected[missing_columns].isna().sum())
+        if class_summary is not None:
+            class_values = class_summary[class_summary["class"] == class_label]
+            print("\nExact class-level values:")
+            print(class_values.to_string(index=False, float_format=lambda value: f"{value:.{precision}g}"))
+    return selected
