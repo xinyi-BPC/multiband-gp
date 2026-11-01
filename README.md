@@ -16,9 +16,6 @@ for irregular multi-band astronomical light curves.
 - `figures/`: figures previously generated in the repository root.
 - `reports/`: project PDF reports.
 
-The Part 3 deliverables retain only the final nCRPS/nRMSE presentation. Historical
-CRPS-only and intermediate rendering directories are intentionally excluded.
-
 ## Getting started
 
 Create a virtual environment and install the scientific Python dependencies:
@@ -29,11 +26,4 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Start with `getting_started.ipynb` for data inspection. The experiment notebooks
-and saved result tables are included for analysis and reproducibility.
-
-## Output conventions
-
-- Normalized predictive accuracy is reported with **nRMSE** and **nCRPS**.
-- Generated top-level plots should be written under `figures/`.
-- Local environments, caches, smoke outputs, and editor settings are ignored by Git.
+Start with `getting_started.ipynb` for data inspection. 
