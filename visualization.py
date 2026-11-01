@@ -367,6 +367,9 @@ def plot_feature_vs_metric_scatter(
     alpha: float = 0.4,
     add_trend: bool = True,
     figsize: tuple[float, float] = (6, 4),
+    ax=None,
+    color=None,
+    label=None,
 ):
     """Scatter plot of one GP metric against one feature.
 
@@ -380,10 +383,14 @@ def plot_feature_vs_metric_scatter(
     tmp[metric_col] = pd.to_numeric(tmp[metric_col], errors="coerce")
     tmp = tmp.dropna(subset=[feature_col, metric_col])
 
-    fig, ax = plt.subplots(figsize=figsize)
+    created_axis = ax is None
+    if created_axis:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
 
     if class_col is None:
-        ax.scatter(tmp[feature_col], tmp[metric_col], alpha=alpha)
+        ax.scatter(tmp[feature_col], tmp[metric_col], alpha=alpha, color=color, label=label)
     else:
         for cls, group in tmp.groupby(class_col):
             ax.scatter(
@@ -420,7 +427,8 @@ def plot_feature_vs_metric_scatter(
     ax.set_ylabel(metric_col)
     ax.set_title(f"{metric_col} vs {feature_col}")
     ax.grid(True)
-    fig.tight_layout()
+    if created_axis:
+        fig.tight_layout()
 
     return fig, ax
 
@@ -430,6 +438,7 @@ def plot_metric_by_feature_group(
     group_col: str,
     feature_col: str,
     metric_col: str,
+    *, ax=None, color=None, label=None, use_group_labels=False, show=True,
 ):
     """Plot mean GP metric by feature group.
 
@@ -464,26 +473,26 @@ def plot_metric_by_feature_group(
     if y_col not in summary.columns:
         raise KeyError(f"Missing metric median column: {y_col}")
 
-    x = summary[x_col]
+    x = summary[group_col] if use_group_labels else summary[x_col]
     y = summary[y_col]
     yerr_lower = y - summary[q25_col]
     yerr_upper = summary[q75_col] - y
-
-    plt.figure(figsize=(6, 4))
-    plt.errorbar(
-        x,
-        y,
-        yerr=[yerr_lower, yerr_upper],
-        marker="o",
-        capsize=3,
-    )
-
-    plt.xlabel(feature_col)
-    plt.ylabel(f"Median {metric_col} with IQR")
-    plt.title(f"{metric_col} by {group_col}")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+    created_axis = ax is None
+    if created_axis:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.figure
+    ax.errorbar(x, y, yerr=[yerr_lower, yerr_upper], marker="o", capsize=3,
+                color=color, label=label)
+    ax.set_xlabel(group_col if use_group_labels else feature_col)
+    ax.set_ylabel(f"Median {metric_col} with IQR")
+    ax.set_title(f"{metric_col} by {group_col}")
+    ax.grid(True, alpha=0.2)
+    if created_axis:
+        fig.tight_layout()
+        if show:
+            plt.show()
+    return fig, ax
 
 
 def plot_object_band_lightcurve(

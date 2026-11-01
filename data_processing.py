@@ -706,6 +706,7 @@ def process_one_obj_one_band_train_heldout(
         min_heldout_points=1,
         random_state=0,
         strategy="random",
+        split_indices=None,
 ):
     """
     Split raw observations first, then fit preprocessing from training data only.
@@ -714,6 +715,8 @@ def process_one_obj_one_band_train_heldout(
     By default, the object's peak-flux observation is forced into train_data and
     excluded from heldout_data.
     Background and scale are fit from training data only, then reused for held-out data.
+    Optional split_indices=(train, heldout) bypasses random splitting; unused rows
+    are ignored, and preprocessing uses only the explicit training subset.
     """
     t_raw, y_raw, yerr_raw = _extract_valid_band_observations(example, target_band)
     if len(t_raw) < min_points:
@@ -725,15 +728,29 @@ def process_one_obj_one_band_train_heldout(
         else None
     )
 
-    train_indices, heldout_indices = _split_indices(
-        len(t_raw),
-        heldout_fraction=heldout_fraction,
-        min_train_points=min_train_points,
-        min_heldout_points=min_heldout_points,
-        random_state=random_state,
-        strategy=strategy,
-        force_train_indices=force_train_indices,
-    )
+    if split_indices is None:
+        train_indices, heldout_indices = _split_indices(
+            len(t_raw),
+            heldout_fraction=heldout_fraction,
+            min_train_points=min_train_points,
+            min_heldout_points=min_heldout_points,
+            random_state=random_state,
+            strategy=strategy,
+            force_train_indices=force_train_indices,
+        )
+    else:
+        # Explicit subsets let sparsity experiments ignore unused development rows.
+        train_indices, heldout_indices = (
+            np.asarray(indices, dtype=int) for indices in split_indices
+        )
+        for indices in (train_indices, heldout_indices):
+            if (indices.ndim != 1 or len(np.unique(indices)) != len(indices)
+                    or np.any((indices < 0) | (indices >= len(t_raw)))):
+                raise ValueError("Invalid explicit split indices.")
+        if len(train_indices) < 2 or len(heldout_indices) < min_heldout_points:
+            raise ValueError("Explicit split needs at least two train points and the minimum heldout points.")
+        if np.intersect1d(train_indices, heldout_indices).size:
+            raise ValueError("Explicit training and heldout indices overlap.")
     train_indices = train_indices[np.argsort(t_raw[train_indices])]
     heldout_indices = heldout_indices[np.argsort(t_raw[heldout_indices])]
 

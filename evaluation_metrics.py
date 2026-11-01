@@ -210,7 +210,9 @@ def _plot_pit_reliability_on_axis(ax, pit_values, title=None, q_grid=None):
     return ax
 
 
-def plot_pit_histogram(pit_values, title=None, bins=20, save_path=None, density=True):
+def plot_pit_histogram(
+        pit_values, title=None, bins=20, save_path=None, density=True, save_dpi=300,
+):
     """
     Plot a PIT histogram with the Uniform(0, 1) reference density.
     """
@@ -220,11 +222,13 @@ def plot_pit_histogram(pit_values, title=None, bins=20, save_path=None, density=
     _plot_pit_histogram_on_axis(ax, pit_values, title=title, bins=bins, density=density)
     fig.tight_layout()
     if save_path is not None:
-        fig.savefig(save_path, bbox_inches="tight")
+        fig.savefig(save_path, dpi=save_dpi, bbox_inches="tight")
     return fig, ax
 
 
-def plot_pit_reliability_curve(pit_values, title=None, q_grid=None, save_path=None):
+def plot_pit_reliability_curve(
+        pit_values, title=None, q_grid=None, save_path=None, save_dpi=300,
+):
     """
     Plot the empirical PIT CDF against the ideal diagonal.
     """
@@ -234,7 +238,7 @@ def plot_pit_reliability_curve(pit_values, title=None, q_grid=None, save_path=No
     _plot_pit_reliability_on_axis(ax, pit_values, title=title, q_grid=q_grid)
     fig.tight_layout()
     if save_path is not None:
-        fig.savefig(save_path, bbox_inches="tight")
+        fig.savefig(save_path, dpi=save_dpi, bbox_inches="tight")
     return fig, ax
 
 
@@ -245,6 +249,7 @@ def plot_pit_diagnostics(
         q_grid=None,
         save_path=None,
         density=True,
+        save_dpi=300,
 ):
     """
     Plot PIT histogram and PIT reliability curve side by side.
@@ -271,7 +276,7 @@ def plot_pit_diagnostics(
     )
     fig.tight_layout()
     if save_path is not None:
-        fig.savefig(save_path, bbox_inches="tight")
+        fig.savefig(save_path, dpi=save_dpi, bbox_inches="tight")
     return fig, axes
 
 
@@ -762,14 +767,22 @@ def summarize_single_band_gp_class_metrics(
         output_path: str | Path | None = "single_band_gp_class_summary.csv",
         print_table: bool = True,
         plot_pit: bool = False,
-        pit_output_dir: str | Path | None = None,
+        pit_output_dir: str | Path | None = "figures/pit_diagnostics",
         pit_bins: int = 20,
+        overall_label: str = "overall",
+        overall_pit_output_path: str | Path | None = "figures/pit_diagnostics/overall.png",
+        figure_dpi: int = 300,
 ) -> pd.DataFrame:
     """
     Summarize single-band GP evaluation metrics by object class.
 
     Class-level metrics are object-weighted: metrics are computed per object
-    first, then summarized across objects within each class.
+    first, then summarized across objects within each class. The returned and
+    saved table also contains an ``overall`` row computed from every retained
+    object. When ``plot_pit=True``, every class PIT diagnostic is saved in
+    ``pit_output_dir`` and the overall diagnostic is saved to
+    ``overall_pit_output_path``. By default these are written to the current
+    directory under ``figures/pit_diagnostics``.
     """
     object_table, skipped_table = _single_band_gp_object_and_skipped_tables(
         object_results,
@@ -783,6 +796,9 @@ def summarize_single_band_gp_class_metrics(
     if plot_pit and pit_output_dir is not None:
         pit_output_dir = Path(pit_output_dir)
         pit_output_dir.mkdir(parents=True, exist_ok=True)
+    if plot_pit and overall_pit_output_path is not None:
+        overall_pit_output_path = Path(overall_pit_output_path)
+        overall_pit_output_path.parent.mkdir(parents=True, exist_ok=True)
     skipped_counts: dict[Any, int] = {}
     if not skipped_table.empty:
         skipped_classes = cast(pd.Series, skipped_table["class"])
@@ -804,20 +820,15 @@ def summarize_single_band_gp_class_metrics(
         ("ks_pit", "ks_pit_object"),
     ]
 
-    class_series = cast(pd.Series, object_table["class"])
-    for class_label in sorted(pd.unique(class_series), key=str):
-        group = object_table.loc[class_series.eq(class_label), :].copy()
+    def summarize_group(group, class_label, n_skipped):
         n_objects = int(group.shape[0])
-        if n_objects < 2:
-            continue
-
         n_target_train = np.asarray(group["n_target_train_object"], dtype=float)
         object_flux_scale = np.asarray(group["object_flux_scale"], dtype=float)
         sparse_mask = n_target_train < sparse_threshold
         row = {
             "class": class_label,
             "n_objects": n_objects,
-            "n_objects_skipped_small_flux": int(skipped_counts.get(class_label, 0)),
+            "n_objects_skipped_small_flux": int(n_skipped),
             "min_object_flux_scale": np.nan if min_object_flux_scale is None else float(min_object_flux_scale),
             "n_target_train_mean": float(np.mean(n_target_train)),
             "n_target_train_std": float(np.std(n_target_train)),
@@ -858,7 +869,9 @@ def summarize_single_band_gp_class_metrics(
             class_pit = np.concatenate(class_pit_arrays) if class_pit_arrays else np.array([], dtype=float)
             safe_class = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(class_label))
             diagnostics_path = None
-            if pit_output_dir is not None:
+            if class_label == overall_label:
+                diagnostics_path = overall_pit_output_path
+            elif pit_output_dir is not None:
                 pit_dir = Path(pit_output_dir)
                 diagnostics_path = pit_dir / f"pit_diagnostics_{safe_class}.png"
             plot_pit_diagnostics(
@@ -866,6 +879,7 @@ def summarize_single_band_gp_class_metrics(
                 title=f"PIT diagnostics: {class_label}",
                 bins=pit_bins,
                 save_path=diagnostics_path,
+                save_dpi=figure_dpi,
             )
 
         # Within-object z_std is unstable for very small n_test_object, so the filtered columns are included for interpretation.
@@ -880,7 +894,26 @@ def summarize_single_band_gp_class_metrics(
             row["z_std_mean_n_test_ge_5"] = zstd_mean
             row["z_std_std_n_test_ge_5"] = zstd_std
 
-        rows.append(row)
+        return row
+
+    class_series = cast(pd.Series, object_table["class"])
+    for class_label in sorted(pd.unique(class_series), key=str):
+        group = object_table.loc[class_series.eq(class_label), :].copy()
+        if group.shape[0] < 2:
+            continue
+        rows.append(summarize_group(
+            group,
+            class_label,
+            skipped_counts.get(class_label, 0),
+        ))
+
+    # Use the same object-level weighting for the aggregate so densely sampled
+    # objects cannot dominate the overall metrics.
+    rows.append(summarize_group(
+        object_table.copy(),
+        overall_label,
+        skipped_table.shape[0],
+    ))
 
     summary = pd.DataFrame(rows)
     if output_path is not None:
@@ -1113,6 +1146,7 @@ def _metrics_row_from_result(model_name, metrics, train_data, target_band, heldo
         "pit": pit,
         "y_true": y_true,
         "y_pred": y_pred,
+        "y_std": y_std,
         "notes": notes,
     }
 
@@ -1184,6 +1218,13 @@ def summarize_metrics_by_band(object_results):
     return summary
 
 
+SPARSITY_DIMENSIONS = ("target_train_fraction", "aux_train_fraction", "random_state")
+
+
+def _ablation_case_keys(df):
+    return ["object_id", "target_band"] + [c for c in SPARSITY_DIMENSIONS if c in df.columns] + (["split_id"] if "split_id" in df.columns else [])
+
+
 def _canonical_ablation_model_name(model):
     model = str(model)
     if model.startswith("mogp_shuffled_wavelength_control_seed"):
@@ -1211,14 +1252,14 @@ def collapse_shuffled_wavelength_controls(
     if keep_seed_level:
         return df
 
-    group_cols = ["model", "object_id", "target_band"]
+    group_cols = ["model"] + _ablation_case_keys(df)
     missing = [col for col in group_cols if col not in df.columns]
     if missing:
         raise ValueError(f"results_df missing required columns for shuffled collapse: {missing}")
 
     numeric_cols = [
         col for col in df.select_dtypes(include=[np.number]).columns
-        if col not in {"shuffle_repeat"}
+        if col not in set(group_cols + ["shuffle_repeat"])
     ]
     first_cols = [
         col for col in df.columns
@@ -1371,6 +1412,9 @@ def aggregate_gp_ablation_results(
         keep_seed_level=keep_seed_level,
     )
 
+    group_cols = list(dict.fromkeys(list(group_cols) + [
+        c for c in SPARSITY_DIMENSIONS if c in df.columns
+    ]))
     rows = []
     for group_key, group in df.groupby(group_cols, dropna=False):
         if not isinstance(group_key, tuple):
@@ -1446,6 +1490,15 @@ def aggregate_gp_ablation_results(
             # compute object-weighted standard deviation and standard error for the metric
             row[f"{src}_object_std"] = float(np.std(values, ddof=1)) if len(values) > 1 else np.nan
             row[f"{src}_object_se"] = _standard_error(values)
+        for metric in ("rmse", "nrmse", "crps", "ncrps", "nlpd", "ks_pit",
+                       "coverage_1sigma", "coverage_2sigma", "coverage_3sigma",
+                       "z_score_mean", "z_score_std"):
+            values = pd.to_numeric(group[metric], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+            row[f"{metric}_count"] = len(values)
+            row[f"{metric}_mean"] = values.mean()
+            row[f"{metric}_median"] = values.median()
+            row[f"{metric}_q25"] = values.quantile(0.25)
+            row[f"{metric}_q75"] = values.quantile(0.75)
         ks_values = group["ks_pit"].astype(float).to_numpy()
         row["ks_pit_object_std"] = float(np.std(ks_values, ddof=1)) if len(ks_values) > 1 else np.nan
         row["ks_pit_object_se"] = _standard_error(ks_values)
@@ -1481,6 +1534,19 @@ def compare_models_aggregated(
         collapse_shuffled=collapse_shuffled,
         keep_seed_level=keep_seed_level,
     )
+
+    dimensions = [c for c in SPARSITY_DIMENSIONS if c in df.columns]
+    if dimensions:
+        summaries = []
+        for key, group in df.groupby(dimensions, dropna=False):
+            key = key if isinstance(key, tuple) else (key,)
+            summary = compare_models_aggregated(
+                group.drop(columns=dimensions), model_pairs=model_pairs,
+                collapse_shuffled=False, keep_seed_level=keep_seed_level)
+            for col, value in zip(dimensions, key):
+                summary[col] = value
+            summaries.append(summary)
+        return pd.concat(summaries, ignore_index=True) if summaries else pd.DataFrame()
 
     out_rows = []
     for model_a, model_b in model_pairs:
@@ -1704,3 +1770,242 @@ def plot_gp_ablation_summary(
     figures["z_score_std_by_model"] = fig
 
     return figures
+
+
+def _paired_two_model_sparsity_results(results_df):
+    """One-to-one independent minus multiband differences; positive means transfer helps."""
+    keys = _ablation_case_keys(results_df)
+    models = ("mogp_real_wavelength", "mogp_independent_band_control")
+    selected = results_df[results_df["model"].isin(models)].copy()
+    if selected.duplicated(keys + ["model"]).any():
+        raise ValueError("Duplicate object/split/fraction/model rows prevent one-to-one pairing.")
+    real = selected[selected["model"] == models[0]]
+    independent = selected[selected["model"] == models[1]]
+    paired = real.merge(independent, on=keys, suffixes=("_multiband", "_independent"),
+                        how="inner", validate="one_to_one")
+    # Check identity before reporting any paired improvements.
+    for _, row in paired.iterrows():
+        for col in ("heldout_indices", "target_train_indices", "target_pool_indices",
+                    "aux_selected_indices_by_band", "y_true", "training_row_ids", "evaluation_yerr_raw"):
+            left, right = row.get(col + "_multiband"), row.get(col + "_independent")
+            if left is not None and right is not None:
+                if not np.array_equal(left, right):
+                    raise ValueError(f"Paired models differ in {col}.")
+    for metric in (("nrmse", "crps", "ncrps") if "ncrps" in results_df else ("nrmse", "crps")):
+        paired[f"delta_{metric}"] = paired[f"{metric}_independent"] - paired[f"{metric}_multiband"]
+    if "class_multiband" in paired:
+        paired["class"] = paired["class_multiband"]
+    return paired
+
+
+THREE_SPARSITY_MODELS = ("single_band_gp", "mogp_independent_band_control", "mogp_real_wavelength")
+
+
+def paired_target_sparsity_results(results_df, require_triplets=None):
+    """Match complete triplets; legacy two-model rows retain their original schema."""
+    if require_triplets is None:
+        require_triplets = "single_band_gp" in set(results_df["model"])
+    if not require_triplets:
+        return _paired_two_model_sparsity_results(results_df)
+    keys = _ablation_case_keys(results_df)
+    selected = results_df[results_df["model"].isin(THREE_SPARSITY_MODELS)].copy()
+    if selected.duplicated(keys + ["model"]).any():
+        raise ValueError("Duplicate object/split/fraction/model rows prevent one-to-one pairing.")
+    complete, incomplete = [], []
+    for key, group in selected.groupby(keys, dropna=False):
+        present = set(group["model"])
+        finite_metrics = ["crps", "nrmse"] + (["ncrps"] if "ncrps" in group else [])
+        finite = np.isfinite(group[finite_metrics].to_numpy(dtype=float)).all()
+        if present != set(THREE_SPARSITY_MODELS) or not finite:
+            incomplete.append({**dict(zip(keys, key)), "present_models": sorted(present),
+                               "missing_models": sorted(set(THREE_SPARSITY_MODELS) - present),
+                               "reason": "missing model" if finite else "nonfinite metric"})
+            continue
+        # The target data and evaluation denominator must match across all three.
+        first = group.iloc[0]
+        for col in ("target_train_indices", "target_pool_indices", "heldout_indices",
+                    "evaluation_yerr_raw", "y_true", "object_flux_scale"):
+            if col in group:
+                if not all(np.array_equal(first[col], value) for value in group[col]):
+                    raise ValueError(f"Triplet models differ in {col}.")
+        complete.append(group)
+    valid = pd.concat(complete, ignore_index=True) if complete else selected.iloc[:0]
+    paired = _paired_two_model_sparsity_results(valid)
+    single = valid[valid["model"] == "single_band_gp"].rename(
+        columns={c: c + "_single" for c in valid.columns if c not in keys})
+    paired = paired.merge(single, on=keys, how="inner", validate="one_to_one")
+    for metric in (("crps", "ncrps", "nrmse") if "ncrps" in results_df else ("crps", "nrmse")):
+        paired[f"delta_shared_{metric}"] = paired[f"{metric}_single"] - paired[f"{metric}_independent"]
+        paired[f"delta_cross_{metric}"] = paired[f"{metric}_independent"] - paired[f"{metric}_multiband"]
+        paired[f"delta_total_{metric}"] = paired[f"{metric}_single"] - paired[f"{metric}_multiband"]
+        if not np.allclose(paired[f"delta_total_{metric}"],
+                           paired[f"delta_shared_{metric}"] + paired[f"delta_cross_{metric}"],
+                           atol=1e-12, rtol=1e-10):
+            raise AssertionError("Paired delta_total != delta_shared + delta_cross.")
+    paired.attrs["incomplete_triplets"] = pd.DataFrame(incomplete, columns=keys + ["present_models", "missing_models", "reason"])
+    return paired
+
+
+def _object_level_sparsity_rows(df, paired=False):
+    """Average repeated seeds within each object before across-object statistics."""
+    dimensions = ["object_id", "target_band", "target_train_fraction", "aux_train_fraction"]
+    if not paired:
+        dimensions = ["model"] + dimensions
+    if paired:
+        numeric = [c for c in df if c.startswith("delta_")]
+    else:
+        numeric = [c for c in df.select_dtypes(include=[np.number])
+                   if c not in dimensions + ["random_state", "fit_random_state"]]
+    spec = {c: "mean" for c in numeric}
+    if "class" in df:
+        spec["class"] = "first"
+    # Keep the set/count of contributing splits, without pretending they are objects.
+    if "random_state" in df:
+        spec["random_state"] = lambda values: sorted(set(values))
+    if "split_id" in df:
+        spec["split_id"] = list
+    result = df.groupby(dimensions, dropna=False, as_index=False).agg(spec)
+    if "random_state" in result:
+        result = result.rename(columns={"random_state": "random_states"})
+        result["n_seeds"] = result["random_states"].map(len)
+    if "split_id" in result:
+        result = result.rename(columns={"split_id": "split_ids"})
+    return result
+
+
+def _summarize_paired_sparsity(paired, group_cols):
+    rows = []
+    for key, group in paired.groupby(group_cols, dropna=False):
+        key = key if isinstance(key, tuple) else (key,)
+        row = dict(zip(group_cols, key))
+        row["n_paired_cases"] = len(group)
+        row["n_paired_objects"] = group["object_id"].nunique()
+        for metric in [c for c in group if c.startswith("delta_") and not c.endswith(("_single", "_independent", "_multiband"))]:
+            values = group[metric].replace([np.inf, -np.inf], np.nan).dropna()
+            row.update({f"{metric}_count": len(values), f"{metric}_mean": values.mean(),
+                        f"{metric}_median": values.median(),
+                        f"{metric}_q25": values.quantile(0.25),
+                        f"{metric}_q75": values.quantile(0.75),
+                        f"{metric}_positive_fraction": float((values > 0).mean()),
+                        f"{metric}_negative_fraction": float((values < 0).mean())})
+        rows.append(row)
+    columns = list(group_cols) + ["n_paired_cases", "n_paired_objects"]
+    deltas = [c for c in paired if c.startswith("delta_")]
+    for metric in deltas:
+        columns += [f"{metric}_{stat}" for stat in
+                    ("count", "mean", "median", "q25", "q75", "positive_fraction", "negative_fraction")]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def save_target_sparsity_reports(results_df, output_dir=".", require_triplets=None, primary_metric="crps"):
+    """Extend existing sparsity CSVs/plots with triplets and object-clustered summaries.
+
+    In the three-model design, average seeds within objects first. IQRs describe
+    between-object dispersion, not confidence intervals from independent seeds.
+    Two-model historical input remains supported with its original conventions.
+    """
+    import matplotlib.pyplot as plt
+
+    if primary_metric not in ("crps", "ncrps") or primary_metric not in results_df:
+        raise ValueError("primary_metric must name an available crps or ncrps column.")
+    metric_labels = {"crps": "CRPS", "ncrps": "nCRPS", "nrmse": "nRMSE"}
+
+    required = {"target_train_fraction", "aux_train_fraction", "random_state"}
+    if not required.issubset(results_df.columns):
+        raise ValueError(f"Sparsity reports require columns {sorted(required)}.")
+    if require_triplets is None:
+        require_triplets = "single_band_gp" in set(results_df["model"])
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dimensions = ["target_band", "target_train_fraction", "aux_train_fraction"]
+    summary = aggregate_gp_ablation_results(
+        results_df, group_cols=["model"] + dimensions, min_cases_warn=0)
+    paired = paired_target_sparsity_results(results_df, require_triplets=require_triplets)
+    paired_seed = _summarize_paired_sparsity(paired, dimensions + ["random_state"])
+    if require_triplets:
+        # Compare model curves on the same successful triplets, retaining all
+        # successful individual fits separately in raw/per-seed diagnostics.
+        keys = _ablation_case_keys(results_df)
+        complete_rows = results_df.merge(paired[keys], on=keys, how="inner", validate="many_to_one")
+        object_rows = _object_level_sparsity_rows(complete_rows)
+        object_paired = _object_level_sparsity_rows(paired, paired=True)
+        pooled = aggregate_gp_ablation_results(
+            object_rows, group_cols=["model"] + dimensions,
+            collapse_shuffled=False, min_cases_warn=0) if len(object_rows) else pd.DataFrame(
+                columns=["model"] + dimensions + [f"{metric}_{stat}" for metric in ("crps", "nrmse")
+                                                  for stat in ("median", "q25", "q75")])
+        paired_pooled = _summarize_paired_sparsity(object_paired, dimensions)
+    else:
+        pooled = aggregate_gp_ablation_results(
+            collapse_shuffled_wavelength_controls(results_df).drop(columns="random_state"),
+            group_cols=["model"] + dimensions, collapse_shuffled=False, min_cases_warn=0)
+        paired_pooled = _summarize_paired_sparsity(paired, dimensions)
+    tables = {"rows": results_df, "summary_by_seed": summary, "summary": pooled,
+              "paired_rows": paired, "paired_summary_by_seed": paired_seed,
+              "paired_summary": paired_pooled}
+    if require_triplets:
+        tables.update(object_rows=object_rows, paired_object_rows=object_paired,
+                      incomplete_triplets=paired.attrs["incomplete_triplets"])
+    paths = {}
+    for name, table in tables.items():
+        paths[name] = output_dir / f"target_sparsity_{name}.csv"
+        table.to_csv(paths[name], index=False)
+    figures = {}
+    model_labels = {"single_band_gp": "Single-band", "mogp_independent_band_control": "Independent-band",
+                    "mogp_real_wavelength": "Real-wavelength"}
+    model_colors = {"single_band_gp": "#555555", "mogp_independent_band_control": "#0072B2",
+                    "mogp_real_wavelength": "#D55E00"}
+    difference_colors = {"shared": "#009E73", "cross": "#0072B2", "total": "#D55E00"}
+    for metric in ("nrmse", primary_metric, "delta_nrmse", f"delta_{primary_metric}"):
+        fig, ax = plt.subplots(figsize=(7, 4))
+        is_delta = metric.startswith("delta_")
+        table = paired_pooled if is_delta else pooled
+        group_cols = ["target_band", "aux_train_fraction"]
+        if not is_delta:
+            table = table[table["model"].isin(model_labels)]
+            group_cols = ["model"] + group_cols
+        for key, group in table.groupby(group_cols, dropna=False):
+            key = key if isinstance(key, tuple) else (key,)
+            group = group.sort_values("target_train_fraction")
+            x = group["target_train_fraction"].to_numpy(dtype=float)
+            if is_delta:
+                base_metric = metric.removeprefix("delta_")
+                series = [(f"delta_{kind}_{base_metric}", f"Δ{kind}", difference_colors[kind])
+                          for kind in ("shared", "cross", "total")] if require_triplets else [(metric, "Independent − real", "#0072B2")]
+            else:
+                series = [(metric, model_labels[key[0]], model_colors[key[0]])]
+            suffix = f" ({key[-2]}, aux={key[-1]})"
+            for column, label, color in series:
+                ax.plot(x, group[f"{column}_median"].to_numpy(dtype=float), marker="o", color=color, label=label+suffix)
+                ax.fill_between(x, group[f"{column}_q25"].to_numpy(dtype=float),
+                                group[f"{column}_q75"].to_numpy(dtype=float), color=color, alpha=0.15)
+        if is_delta:
+            ax.axhline(0, color="black", linestyle="--", linewidth=1)
+        title = metric_labels[metric.removeprefix("delta_")]
+        ax.set(xlabel="Target training fraction", ylabel=("Paired improvement in " if is_delta else "")+title,
+               title=("Paired " if is_delta else "")+title+": median and IQR")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize="small")
+        fig.tight_layout()
+        paths[metric] = output_dir / f"target_sparsity_{metric}.png"
+        fig.savefig(paths[metric], dpi=160)
+        figures[metric] = fig
+        plt.close(fig)
+    if require_triplets:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), sharey=True)
+        for ax, metric in zip(axes, (primary_metric, "nrmse")):
+            for key, group in paired_pooled.groupby(["target_band", "aux_train_fraction"], dropna=False):
+                group = group.sort_values("target_train_fraction")
+                for kind, color in difference_colors.items():
+                    ax.plot(group["target_train_fraction"], group[f"delta_{kind}_{metric}_negative_fraction"],
+                            marker="o", color=color, label=f"Δ{kind} ({key[0]}, aux={key[1]})")
+            ax.set(title=metric_labels[metric], xlabel="Target training fraction", ylim=(0,1))
+            if ax.lines:
+                ax.legend(fontsize="small")
+        axes[0].set_ylabel("Fraction of objects with negative improvement")
+        fig.tight_layout()
+        paths["negative_transfer"] = output_dir / "target_sparsity_negative_transfer.png"
+        fig.savefig(paths["negative_transfer"], dpi=160)
+        figures["negative_transfer"] = fig
+        plt.close(fig)
+    return {**tables, "paths": paths, "figures": figures}

@@ -30,6 +30,23 @@ except ImportError:
 TIME_BINS = np.linspace(-500, 500, 50)
 BIN_CENTERS = (TIME_BINS[:-1] + TIME_BINS[1:]) / 2
 
+
+def assign_time_bins(times, bin_edges=None):
+    """Shared observed-time bins; preserves the class-template boundary rules."""
+    return pd.cut(times, TIME_BINS if bin_edges is None else bin_edges,
+                  labels=False, include_lowest=True)
+
+
+def median_flux_in_time_bins(times, flux, bin_edges=None):
+    """Median observed flux per occupied bin; no interpolation or empty-bin fill."""
+    frame = pd.DataFrame({"time": np.asarray(times, dtype=float),
+                          "flux": np.asarray(flux, dtype=float)})
+    frame = frame[np.isfinite(frame.time) & np.isfinite(frame.flux)].copy()
+    frame["time_bin"] = assign_time_bins(frame.time, bin_edges)
+    frame = frame.dropna(subset=["time_bin"])
+    frame["time_bin"] = frame.time_bin.astype(int)
+    return frame.groupby("time_bin", sort=True).flux.median()
+
 _COLUMN_ALIASES = {
     "object_id": ("object_id", "obj_id", "id"),
     "class": ("obj_type", "class", "target", "object_type", "type"),
@@ -75,8 +92,8 @@ def robust_peak_scale(flux, n_top=5):
 def compute_inter_band_distances(df, columns=None, min_shared_bins=3):
     """Build class-band templates and their pairwise RMSE distances.
 
-    Each object is normalized once, across all of its bands, by the 95th
-    percentile of its finite absolute flux values. The returned tuple contains
+    Each object is normalized once, across all of its bands,
+    by the median of its 5 largest finite absolute flux values. The returned tuple contains
     the tidy distance table, Spearman summary, and class templates.
     """
     if not isinstance(df, pd.DataFrame):
@@ -98,9 +115,7 @@ def compute_inter_band_distances(df, columns=None, min_shared_bins=3):
     )
     work = work[np.isfinite(scales) & (scales > 0)].copy()
     work["normalized_flux"] = work["flux"] / scales[np.isfinite(scales) & (scales > 0)]
-    work["time_bin"] = pd.cut(
-        work["time"], TIME_BINS, labels=False, include_lowest=True
-    )
+    work["time_bin"] = assign_time_bins(work["time"])
     work = work.dropna(subset=["time_bin"])
     work["time_bin"] = work["time_bin"].astype(int)
 

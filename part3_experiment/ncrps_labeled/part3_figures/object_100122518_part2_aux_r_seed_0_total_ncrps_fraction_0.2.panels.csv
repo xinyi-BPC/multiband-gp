@@ -1,0 +1,11 @@
+panel_label,panel_title
+(a),Single-band | target fraction 0.2
+(b),Independent-band | target fraction 0.2
+(c),Real-wavelength | target fraction 0.2
+(d),i-band COMPLETE observations (no GP curve) | train/test/unused/all=4/5/15/24
+(e),r-band COMPLETE observations | train/all=13/26 | full maximum in training: True
+(f),Single-band | target fraction 0.8
+(g),Independent-band | target fraction 0.8
+(h),Real-wavelength | target fraction 0.8
+(i),i-band COMPLETE observations (no GP curve) | train/test/unused/all=19/5/0/24
+(j),r-band COMPLETE observations | train/all=13/26 | full maximum in training: True

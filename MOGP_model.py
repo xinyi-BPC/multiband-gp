@@ -1,5 +1,5 @@
 from itertools import islice
-from typing import Any, cast
+from collections.abc import Mapping
 
 import numpy as np
 import pandas as pd
@@ -743,9 +743,8 @@ def find_reduced_mogp_train_global_percentile_flux_peak(
 def fit_mogp_gp(
         data,
         time_length_scale=0.3,
-        wavelength_length_scale=600.0,
+        wavelength_length_scale=6000.0,
         time_length_scale_bounds=(0.05, 10.0),
-        wavelength_length_scale_bounds=(20.0, 2000.0),
         constant_value=1.0,
         constant_value_bounds=(1e-2, 1e2),
         yerr_scale=1.0,
@@ -755,17 +754,56 @@ def fit_mogp_gp(
         random_state=0,
         print_kernel=False,
 ):
-    """Fit the minimal continuous time+wavelength GP baseline."""
+    """Fit a separable Matérn-3/2 time+wavelength GP.
+
+    X[:, 0] is peak-aligned time divided by the training-time standard
+    deviation; time_length_scale and its bounds use these dimensionless units.
+    X[:, 1] and custom band_to_wavelength mappings must use unscaled nm.
+    The wavelength kernel converts nm to Å internally, so
+    wavelength_length_scale is in Å and is fixed during optimization (6000 Å
+    by default, following Boone 2019). Explicit overrides remain available
+    for the independent-band ablation control. Only the amplitude and temporal
+    length scale are trainable with the default bounds.
+    """
+    class DimensionMatern(Matern):
+        """Apply sklearn's Matérn-3/2 to one column, with optional unit conversion."""
+
+        def __init__(self, active_dim, length_scale=1.0,
+                     length_scale_bounds=(1e-5, 1e5), input_scale=1.0):
+            self.active_dim = active_dim
+            self.input_scale = input_scale
+            super().__init__(length_scale=length_scale,
+                             length_scale_bounds=length_scale_bounds, nu=1.5)
+
+        def _select_dimension(self, X):
+            return np.asarray(X)[:, [self.active_dim]] * self.input_scale
+
+        def __call__(self, X, Y=None, eval_gradient=False):
+            return super().__call__(
+                self._select_dimension(X),
+                None if Y is None else self._select_dimension(Y),
+                eval_gradient=eval_gradient,
+            )
+
+        def diag(self, X):
+            return super().diag(self._select_dimension(X))
+
+        def __repr__(self):
+            return (f"Matern(dim={self.active_dim}, "
+                    f"length_scale={self.length_scale:.3g}, nu=1.5)")
+
     kernel = ConstantKernel(
         constant_value,
         constant_value_bounds,
-    ) * Matern(
-        length_scale=[time_length_scale, wavelength_length_scale],
-        length_scale_bounds=cast(
-            Any,
-            [time_length_scale_bounds, wavelength_length_scale_bounds],
-        ),
-        nu=1.5,
+    ) * DimensionMatern(
+        active_dim=0,
+        length_scale=time_length_scale,
+        length_scale_bounds=time_length_scale_bounds,
+    ) * DimensionMatern(
+        active_dim=1,
+        length_scale=wavelength_length_scale,
+        length_scale_bounds="fixed",
+        input_scale=10.0,  # Existing X stores nm; the fixed length scale uses Å.
     )
 
     yerr_scaled = np.asarray(data["yerr"], dtype=float)
@@ -990,6 +1028,8 @@ def _evaluate_mogp_on_target_heldout(
         object_flux_scale=None,
         nrmse_quantile=0.95,
         nrmse_epsilon=1e-8,
+        yerr_scale=1.0,
+        noise_floor=0.0,
 ):
     metrics = evaluate_mogp_heldout_metrics(
         gp,
@@ -1000,15 +1040,81 @@ def _evaluate_mogp_on_target_heldout(
         nrmse_quantile=nrmse_quantile,
         nrmse_epsilon=nrmse_epsilon,
         assert_z_invariance=True,
+        yerr_scale=yerr_scale,
+        noise_floor=noise_floor,
     )
     if not np.all(_band_equal_mask(metrics["band"], target_heldout_data["band"][0])):
         raise AssertionError("MOGP evaluation contains non-target held-out rows.")
     return metrics
 
 
+DEFAULT_TARGET_TRAIN_FRACTIONS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+TARGET_SPARSITY_MODELS = ("mogp_real_wavelength", "mogp_independent_band_control")
+THREE_MODEL_SPARSITY_MODELS = ("single_band_gp", "mogp_independent_band_control", "mogp_real_wavelength")
+
+
+def _matched_sparsity_gp_kwargs(single_kwargs, mogp_kwargs):
+    """Align experiment settings without changing either GP implementation."""
+    single, mogp = dict(single_kwargs or {}), dict(mogp_kwargs or {})
+    if single.pop("kernel_type", "matern") != "matern":
+        raise ValueError("Three-model sparsity requires the Matérn-3/2 temporal kernel.")
+    shared = (
+        ("length_scale", "time_length_scale", 0.3),
+        ("length_scale_bounds", "time_length_scale_bounds", (0.05, 10.0)),
+        ("constant_value", "constant_value", 1.0),
+        ("constant_value_bounds", "constant_value_bounds", (1e-2, 1e2)),
+        ("yerr_scale", "yerr_scale", 1.0), ("noise_floor", "noise_floor", 0.0),
+        ("jitter", "jitter", 1e-8), ("n_restarts_optimizer", "n_restarts_optimizer", 0),
+    )
+    for skey, mkey, default in shared:
+        if skey in single and mkey in mogp and not np.array_equal(single[skey], mogp[mkey]):
+            raise ValueError(f"Conflicting shared GP settings: {skey} / {mkey}.")
+        value = single.get(skey, mogp.get(mkey, default))
+        single[skey] = value
+        mogp[mkey] = value
+    if "random_state" in single or "random_state" in mogp:
+        if not np.array_equal(single.get("random_state"), mogp.get("random_state")):
+            raise ValueError("Specify identical GP random_state overrides for both model families.")
+    return single, mogp
+
+
+
+def _validate_sampling_fractions(target_train_fraction, aux_train_fraction):
+    if not np.isfinite(target_train_fraction) or not 0 < target_train_fraction <= 0.8:
+        raise ValueError("target_train_fraction must be in (0, 0.8].")
+    if not np.isfinite(aux_train_fraction) or not 0 <= aux_train_fraction <= 1:
+        raise ValueError("aux_train_fraction must be in [0, 1].")
+
+
+def _make_target_sparsity_plan(example, target_band, bands, band_to_wavelength,
+                               aux_train_fraction, random_state, **split_kwargs):
+    """Sample once per object/seed, independently of the requested target fractions."""
+    split = _split_raw_band_for_ablation(
+        example, target_band, random_state=random_state, heldout_fraction=0.2,
+        **split_kwargs,
+    )
+    if split is None:
+        raise ValueError(f"Could not create target-band split for {target_band!r}.")
+    # Preserve the original 0.8 split, including its ceil/minimum/peak conventions.
+    rng = np.random.default_rng(random_state)
+    target_order = rng.permutation(split["train_indices"])
+    auxiliary = {}
+    for band in _available_bands(example, bands, band_to_wavelength):
+        if band == target_band or str(band) == str(target_band):
+            continue
+        t, y, yerr = _extract_valid_band_observations(example, band)
+        indices = np.arange(len(t))
+        aux_split = dict(band=band, t_raw=t, y_raw=y, yerr_raw=yerr,
+                         train_indices=indices)
+        selected = np.sort(rng.choice(indices, size=int(np.floor(aux_train_fraction * len(t))),
+                                      replace=False))
+        auxiliary[band] = (aux_split, selected)
+    return dict(target_split=split, target_order=target_order, auxiliary=auxiliary)
+
+
 def run_target_band_ablation_study(
         example,
-        target_band="r",
+        target_band="i",
         bands=("u", "g", "r", "i", "z", 0, 1, 2, 3, 4),
         aux_band_ratios=None,
         shuffle_repeats=3,
@@ -1021,12 +1127,18 @@ def run_target_band_ablation_study(
         strategy="random",
         band_to_wavelength=None,
         include_same_total_train_budget=True,
+        budget_repeats=5,
         nrmse_quantile=0.95,
         nrmse_epsilon=1e-8,
         single_gp_kwargs=None,
         mogp_gp_kwargs=None,
         output_csv_path=None,
         models=DEFAULT_ABLATION_MODELS,
+        target_train_fraction=None,
+        aux_train_fraction=None,
+        _sampling_plan=None,
+        standardize_model_settings=False,
+        continue_on_model_error=False,
 ):
     """
     Run target-band ablations separating training-set size from cross-band covariance.
@@ -1039,11 +1151,24 @@ def run_target_band_ablation_study(
 
     ``models`` may select any subset of ``DEFAULT_ABLATION_MODELS``. Its default
     preserves the original behavior and runs every model.
+    Set target_train_fraction (relative to all valid target points, <=0.8) and
+    aux_train_fraction (relative to all valid points in each auxiliary band) to
+    enable fixed-20%-evaluation sampling. Omit both to retain legacy ratios.
+    Preprocessing is refit only on the selected target training observations.
     """
     band_to_wavelength = band_to_wavelength or DEFAULT_BAND_TO_WAVELENGTH
     aux_band_ratios = aux_band_ratios or {}
     single_gp_kwargs = single_gp_kwargs or {}
     mogp_gp_kwargs = mogp_gp_kwargs or {}
+    if standardize_model_settings:
+        single_gp_kwargs, mogp_gp_kwargs = _matched_sparsity_gp_kwargs(single_gp_kwargs, mogp_gp_kwargs)
+    single_eval_noise = {key: single_gp_kwargs.get(key, default)
+                         for key, default in (("yerr_scale", 1.0), ("noise_floor", 0.0))}
+    mogp_eval_noise = {key: mogp_gp_kwargs.get(key, default)
+                       for key, default in (("yerr_scale", 1.0), ("noise_floor", 0.0))}
+    budget_repeats = int(budget_repeats)
+    if budget_repeats < 1:
+        raise ValueError("budget_repeats must be at least 1.")
     if isinstance(models, str):
         models = (models,)
     models = set(DEFAULT_ABLATION_MODELS if models is None else models)
@@ -1057,6 +1182,37 @@ def run_target_band_ablation_study(
         models.discard("same_total_train_budget_existing")
     if not models:
         raise ValueError("models must select at least one ablation model.")
+    fraction_mode = target_train_fraction is not None or aux_train_fraction is not None
+    if fraction_mode:
+        target_train_fraction = 0.8 if target_train_fraction is None else float(target_train_fraction)
+        aux_train_fraction = 0.5 if aux_train_fraction is None else float(aux_train_fraction)
+        _validate_sampling_fractions(target_train_fraction, aux_train_fraction)
+        if aux_band_ratios:
+            raise ValueError("Use aux_train_fraction or legacy aux_band_ratios, not both.")
+        if heldout_fraction != 0.2:
+            raise ValueError("Target sparsity requires heldout_fraction=0.2.")
+        if _sampling_plan is None:
+            _sampling_plan = _make_target_sparsity_plan(
+                example, target_band, bands, band_to_wavelength, aux_train_fraction,
+                random_state, min_train_points=min_train_points,
+                min_heldout_points=min_heldout_points, strategy=strategy,
+                force_peak_in_train=force_peak_in_train, peak_mode=peak_mode,
+            )
+        # Match stochastic optimizer initialization as well as training rows.
+        mogp_gp_kwargs = dict(mogp_gp_kwargs)
+        mogp_gp_kwargs.setdefault("random_state", random_state)
+        single_gp_kwargs = dict(single_gp_kwargs)
+        single_gp_kwargs.setdefault("random_state", random_state)
+        target_split = _sampling_plan["target_split"]
+        pool = target_split["train_indices"]
+        n_select = (len(pool) if target_train_fraction == 0.8 else
+                    min(len(pool), int(np.floor(target_train_fraction * len(target_split["t_raw"])))))
+        if n_select < 2:
+            raise ValueError("Target fraction selects fewer than two observations; use more data or a larger fraction.")
+        selected_target = _sampling_plan["target_order"][:n_select]
+        explicit_split = (selected_target, target_split["heldout_indices"])
+    else:
+        explicit_split = None
     rng = np.random.default_rng(random_state)
     object_flux_scale = object_level_empirical_flux_scale(
         example=example,
@@ -1076,22 +1232,26 @@ def run_target_band_ablation_study(
         strategy=strategy,
         force_peak_in_train=force_peak_in_train,
         peak_mode=peak_mode,
+        split_indices=explicit_split,
     )
     if target_train_s is None or target_heldout_s is None:
         raise ValueError(f"Could not create target-band split for {target_band!r}.")
 
     # Recreate the same target-band split in raw format for MOGP
-    target_split = _split_raw_band_for_ablation(
-        example,
-        target_band,
-        heldout_fraction=heldout_fraction,
-        min_train_points=min_train_points,
-        min_heldout_points=min_heldout_points,
-        random_state=random_state,
-        strategy=strategy,
-        force_peak_in_train=force_peak_in_train,
-        peak_mode=peak_mode,
-    )
+    if not fraction_mode:
+        target_split = _split_raw_band_for_ablation(
+            example,
+            target_band,
+            heldout_fraction=heldout_fraction,
+            min_train_points=min_train_points,
+            min_heldout_points=min_heldout_points,
+            random_state=random_state,
+            strategy=strategy,
+            force_peak_in_train=force_peak_in_train,
+            peak_mode=peak_mode,
+        )
+    else:
+        target_split = dict(target_split, train_indices=target_train_s["train_indices"])
     if target_split is None:
         raise ValueError(f"Could not recreate raw target-band split for {target_band!r}.")
     # Assert that the MOGP ablation uses exactly the same indices as the single-band GP
@@ -1118,58 +1278,71 @@ def run_target_band_ablation_study(
     aux_selected_groups = []
     aux_selected_indices_by_band = {}
     # Iterate over all available bands except the target band to create auxiliary training splits and select points based on the specified ratios.
-    for band in _available_bands(example, bands, band_to_wavelength):
-        if _resolve_wavelength(band, band_to_wavelength) == target_wavelength and str(band) == str(target_band):
-            continue
-        if band == target_band:
-            continue
-        ratio = float(aux_band_ratios.get(band, aux_band_ratios.get(str(band), 0.0)))
-        split = _split_raw_band_for_ablation(
-            example,
-            band,
-            heldout_fraction=heldout_fraction,
-            min_train_points=min_train_points,
-            min_heldout_points=min_heldout_points,
-            random_state=random_state,
-            strategy=strategy,
-            force_peak_in_train=force_peak_in_train,
-            peak_mode=peak_mode,
-        )
-        if split is None:
-            continue
-        aux_splits[band] = split
-        selected = _sample_auxiliary_train_indices(split, ratio, rng, n_target_train)
-        aux_selected_indices_by_band[band] = selected
-        aux_selected_groups.append(_raw_rows_from_split(split, selected))
+    if fraction_mode:
+        for band, (split, selected) in _sampling_plan["auxiliary"].items():
+            aux_splits[band] = split
+            aux_selected_indices_by_band[band] = selected
+            aux_selected_groups.append(_raw_rows_from_split(split, selected))
+    else:
+        for band in _available_bands(example, bands, band_to_wavelength):
+            if _resolve_wavelength(band, band_to_wavelength) == target_wavelength and str(band) == str(target_band):
+                continue
+            if band == target_band:
+                continue
+            ratio = float(aux_band_ratios.get(band, aux_band_ratios.get(str(band), 0.0)))
+            split = _split_raw_band_for_ablation(
+                example,
+                band,
+                heldout_fraction=heldout_fraction,
+                min_train_points=min_train_points,
+                min_heldout_points=min_heldout_points,
+                random_state=random_state,
+                strategy=strategy,
+                force_peak_in_train=force_peak_in_train,
+                peak_mode=peak_mode,
+            )
+            if split is None:
+                continue
+            aux_splits[band] = split
+            selected = _sample_auxiliary_train_indices(split, ratio, rng, n_target_train)
+            aux_selected_indices_by_band[band] = selected
+            aux_selected_groups.append(_raw_rows_from_split(split, selected))
 
     real_train_rows = _concat_raw_row_groups([target_train_rows] + aux_selected_groups)
     rows = []
     artifacts = {}
+    failed_models = []
 
     # A. Existing single-band GP.
     if "single_band_gp" in models:
-        single_gp = fit_basic_gp(target_train_s, kernel_type="matern", **single_gp_kwargs)
-        single_metrics = evaluate_heldout_metrics(
-            single_gp,
-            target_heldout_s,
-            train_data=target_train_s,
-            object_data=example,
-            object_flux_scale=object_flux_scale,
-            nrmse_quantile=nrmse_quantile,
-            nrmse_epsilon=nrmse_epsilon,
-        )
-        rows.append(_metrics_row_from_result(
-            "single_band_gp",
-            single_metrics,
-            target_train_s,
-            target_band,
-            target_heldout_s["heldout_indices"],
-        ))
-        artifacts["single_band_gp"] = {
-            "gp": single_gp,
-            "train_data": target_train_s,
-            "heldout_data": target_heldout_s,
-        }
+        try:
+            single_gp = fit_basic_gp(target_train_s, kernel_type="matern", **single_gp_kwargs)
+            single_metrics = evaluate_heldout_metrics(
+                single_gp,
+                target_heldout_s,
+                train_data=target_train_s,
+                object_data=example,
+                object_flux_scale=object_flux_scale,
+                nrmse_quantile=nrmse_quantile,
+                nrmse_epsilon=nrmse_epsilon,
+                **single_eval_noise,
+            )
+            rows.append(_metrics_row_from_result(
+                "single_band_gp",
+                single_metrics,
+                target_train_s,
+                target_band,
+                target_heldout_s["heldout_indices"],
+            ))
+            artifacts["single_band_gp"] = {
+                "gp": single_gp,
+                "train_data": target_train_s,
+                "heldout_data": target_heldout_s,
+            }
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
+            if not continue_on_model_error:
+                raise
+            failed_models.append({"model": "single_band_gp", "reason": str(exc)})
 
     # B. MOGP target-only, fixed wavelength.
     if "mogp_target_only" in models:
@@ -1190,6 +1363,7 @@ def run_target_band_ablation_study(
             object_flux_scale=object_flux_scale,
             nrmse_quantile=nrmse_quantile,
             nrmse_epsilon=nrmse_epsilon,
+            **mogp_eval_noise,
         )
         rows.append(_metrics_row_from_result(
             "mogp_target_only",
@@ -1213,62 +1387,74 @@ def run_target_band_ablation_study(
     )
     if real_train_m is None:
         raise ValueError("Could not build MOGP real-wavelength training data.")
+    if np.intersect1d(real_train_m["row_id"], target_heldout_m["row_id"]).size:
+        raise AssertionError("Target evaluation observations leaked into training.")
     if "mogp_real_wavelength" in models:
-        real_gp = fit_mogp_gp(real_train_m, **mogp_gp_kwargs)
-        real_metrics = _evaluate_mogp_on_target_heldout(
-            real_gp,
-            target_heldout_m,
-            real_train_m,
-            object_data=example,
-            object_flux_scale=object_flux_scale,
-            nrmse_quantile=nrmse_quantile,
-            nrmse_epsilon=nrmse_epsilon,
-        )
-        rows.append(_metrics_row_from_result(
-            "mogp_real_wavelength",
-            real_metrics,
-            real_train_m,
-            target_band,
-            target_heldout_s["heldout_indices"],
-        ))
-        artifacts["mogp_real_wavelength"] = {
-            "gp": real_gp,
-            "train_data": real_train_m,
-            "heldout_data": target_heldout_m,
-            "metrics": real_metrics,
-            "aux_selected_indices_by_band": aux_selected_indices_by_band,
-        }
+        try:
+            real_gp = fit_mogp_gp(real_train_m, **mogp_gp_kwargs)
+            real_metrics = _evaluate_mogp_on_target_heldout(
+                real_gp,
+                target_heldout_m,
+                real_train_m,
+                object_data=example,
+                object_flux_scale=object_flux_scale,
+                nrmse_quantile=nrmse_quantile,
+                nrmse_epsilon=nrmse_epsilon,
+                **mogp_eval_noise,
+            )
+            rows.append(_metrics_row_from_result(
+                "mogp_real_wavelength",
+                real_metrics,
+                real_train_m,
+                target_band,
+                target_heldout_s["heldout_indices"],
+            ))
+            artifacts["mogp_real_wavelength"] = {
+                "gp": real_gp,
+                "train_data": real_train_m,
+                "heldout_data": target_heldout_m,
+                "metrics": real_metrics,
+                "aux_selected_indices_by_band": aux_selected_indices_by_band,
+            }
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
+            if not continue_on_model_error:
+                raise
+            failed_models.append({"model": "mogp_real_wavelength", "reason": str(exc)})
 
     # D. Same points as C, approximate independent-band control.
     if "mogp_independent_band_control" in models:
-        independent_kwargs = dict(mogp_gp_kwargs)
-        independent_kwargs.setdefault("wavelength_length_scale", 1e-6)
-        independent_kwargs.setdefault("wavelength_length_scale_bounds", (1e-6, 1e-6))
-        independent_kwargs.setdefault("n_restarts_optimizer", 0)
-        independent_gp = fit_mogp_gp(real_train_m, **independent_kwargs)
-        independent_metrics = _evaluate_mogp_on_target_heldout(
-            independent_gp,
-            target_heldout_m,
-            real_train_m,
-            object_data=example,
-            object_flux_scale=object_flux_scale,
-            nrmse_quantile=nrmse_quantile,
-            nrmse_epsilon=nrmse_epsilon,
-        )
-        rows.append(_metrics_row_from_result(
-            "mogp_independent_band_control",
-            independent_metrics,
-            real_train_m,
-            target_band,
-            target_heldout_s["heldout_indices"],
-            notes="Approximate independent-band control: wavelength length scale set near zero.",
-        ))
-        artifacts["mogp_independent_band_control"] = {
-            "gp": independent_gp,
-            "train_data": real_train_m,
-            "heldout_data": target_heldout_m,
-            "metrics": independent_metrics,
-        }
+        try:
+            independent_kwargs = dict(mogp_gp_kwargs)
+            independent_kwargs["wavelength_length_scale"] = 1e-5  # Å; 1e-6 nm.
+            independent_gp = fit_mogp_gp(real_train_m, **independent_kwargs)
+            independent_metrics = _evaluate_mogp_on_target_heldout(
+                independent_gp,
+                target_heldout_m,
+                real_train_m,
+                object_data=example,
+                object_flux_scale=object_flux_scale,
+                nrmse_quantile=nrmse_quantile,
+                nrmse_epsilon=nrmse_epsilon,
+                **mogp_eval_noise,
+            )
+            rows.append(_metrics_row_from_result(
+                "mogp_independent_band_control",
+                independent_metrics,
+                real_train_m,
+                target_band,
+                target_heldout_s["heldout_indices"],
+                notes="Approximate independent-band control: wavelength length scale set near zero.",
+            ))
+            artifacts["mogp_independent_band_control"] = {
+                "gp": independent_gp,
+                "train_data": real_train_m,
+                "heldout_data": target_heldout_m,
+                "metrics": independent_metrics,
+            }
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
+            if not continue_on_model_error:
+                raise
+            failed_models.append({"model": "mogp_independent_band_control", "reason": str(exc)})
 
     # E. Same points as C, shuffled non-target wavelengths.
     if "mogp_shuffled_wavelength_control" in models:
@@ -1291,6 +1477,7 @@ def run_target_band_ablation_study(
                 object_flux_scale=object_flux_scale,
                 nrmse_quantile=nrmse_quantile,
                 nrmse_epsilon=nrmse_epsilon,
+                **mogp_eval_noise,
             )
             shuffled_row = _metrics_row_from_result(
                 f"mogp_shuffled_wavelength_control_seed{repeat_idx}",
@@ -1308,17 +1495,41 @@ def run_target_band_ablation_study(
             })
         artifacts["mogp_shuffled_wavelength_control"] = shuffled_rows
 
-    # F. Existing fixed-total-budget comparison: N total rows sampled from all bands.
+    # F. Keep all target rows and randomly sample the same auxiliary-row budget as C.
     if "same_total_train_budget_existing" in models:
-        all_train_groups = [target_train_rows] + [
+        auxiliary_train_groups = [
             _raw_rows_from_split(split, split["train_indices"])
             for split in aux_splits.values()
         ]
-        all_train_rows = _concat_raw_row_groups(all_train_groups)
-        n_budget = len(target_train_rows["t_raw"])
-        if all_train_rows is not None and len(all_train_rows["t_raw"]) >= n_budget:
-            budget_indices = np.sort(rng.choice(np.arange(len(all_train_rows["t_raw"])), size=n_budget, replace=False))
-            budget_rows = {key: value[budget_indices] for key, value in all_train_rows.items()}
+        auxiliary_train_rows = _concat_raw_row_groups(auxiliary_train_groups)
+        n_aux_budget = sum(len(group["t_raw"]) for group in aux_selected_groups)
+
+        if n_aux_budget > 0 and (
+            auxiliary_train_rows is None
+            or len(auxiliary_train_rows["t_raw"]) < n_aux_budget
+        ):
+            raise ValueError("Not enough auxiliary rows for the fixed-total-budget comparison.")
+
+        budget_repeat_rows = []
+        budget_repeat_artifacts = []
+        for repeat_idx in range(budget_repeats):
+            if n_aux_budget == 0:
+                budget_rows = target_train_rows
+            else:
+                repeat_rng = np.random.default_rng(
+                    np.random.SeedSequence([int(random_state), 7919, repeat_idx])
+                )
+                budget_indices = np.sort(repeat_rng.choice(
+                    np.arange(len(auxiliary_train_rows["t_raw"])),
+                    size=n_aux_budget,
+                    replace=False,
+                ))
+                sampled_auxiliary_rows = {
+                    key: value[budget_indices]
+                    for key, value in auxiliary_train_rows.items()
+                }
+                budget_rows = _concat_raw_row_groups([target_train_rows, sampled_auxiliary_rows])
+
             budget_train_m = _build_mogp_data_from_raw_rows(
                 example,
                 budget_rows,
@@ -1336,25 +1547,97 @@ def run_target_band_ablation_study(
                 object_flux_scale=object_flux_scale,
                 nrmse_quantile=nrmse_quantile,
                 nrmse_epsilon=nrmse_epsilon,
+                **mogp_eval_noise,
             )
-            rows.append(_metrics_row_from_result(
+            budget_repeat_rows.append(_metrics_row_from_result(
                 "same_total_train_budget_existing",
                 budget_metrics,
                 budget_train_m,
                 target_band,
                 target_heldout_s["heldout_indices"],
-                notes="Fixed-total-budget comparison, not an isolated cross-band covariance test.",
             ))
-            artifacts["same_total_train_budget_existing"] = {
+            budget_repeat_artifacts.append({
                 "gp": budget_gp,
                 "train_data": budget_train_m,
                 "heldout_data": target_heldout_m,
-            }
+            })
+
+        budget_row = budget_repeat_rows[0].copy()
+        metric_keys = (
+            "rmse", "nrmse", "crps", "ncrps", "nlpd", "ks_pit",
+            "coverage_1sigma", "coverage_2sigma", "coverage_3sigma",
+            "z_score_mean", "z_score_std",
+        )
+        for key in metric_keys:
+            budget_row[key] = float(np.mean([row[key] for row in budget_repeat_rows]))
+        budget_row["budget_repeats"] = budget_repeats
+        budget_row["rmse_repeats"] = np.asarray([
+            row["rmse"] for row in budget_repeat_rows
+        ])
+        budget_row["nrmse_repeats"] = np.asarray([
+            row["nrmse"] for row in budget_repeat_rows
+        ])
+        budget_row["y_pred_repeats"] = np.asarray([
+            row["y_pred"] for row in budget_repeat_rows
+        ])
+        budget_row["nrmse_repeat_std"] = float(np.std(
+            [row["nrmse"] for row in budget_repeat_rows], ddof=1
+        )) if budget_repeats > 1 else 0.0
+        budget_row["notes"] = (
+            f"Mean of {budget_repeats} random auxiliary samples; "
+            "all target rows retained and auxiliary count matched to Model C."
+        )
+        rows.append(budget_row)
+        artifacts["same_total_train_budget_existing"] = budget_repeat_artifacts
 
     expected_heldout = np.asarray(target_heldout_s["heldout_indices"], dtype=int)
     for row in rows:
         if not np.array_equal(np.asarray(row["heldout_indices"], dtype=int), expected_heldout):
             raise AssertionError(f"Held-out indices differ for model {row['model']}.")
+
+    for row in rows:
+        row.update({"class": example["obj_type"], "random_state": random_state})
+        if row["model"] in THREE_MODEL_SPARSITY_MODELS:
+            artifact = artifacts[row["model"]]
+            gp, data = artifact["gp"], artifact["train_data"]
+            # Save fitted parameters in both model and physical units so that
+            # changing train-derived normalization cannot hide parameter drift.
+            is_single = row["model"] == "single_band_gp"
+            time_scale = float(gp.kernel_.k2.length_scale if is_single else gp.kernel_.k1.k2.length_scale)
+            variance = float(gp.kernel_.k1.constant_value if is_single else gp.kernel_.k1.k1.constant_value)
+            row.update({
+                "fitted_time_length_scale": time_scale,
+                "fitted_kernel_variance": variance,
+                "fitted_wavelength_length_scale": np.nan if is_single else float(gp.kernel_.k2.length_scale),
+                "preprocessing_t_scale": float(data["t_scale"]),
+                "preprocessing_flux_scale": float(data["flux_scale"]),
+                "fitted_time_length_scale_raw": time_scale * float(data["t_scale"]),
+                "fitted_kernel_variance_raw": variance * float(data["flux_scale"]) ** 2,
+                "fitted_kernel": str(gp.kernel_),
+                "fit_optimizer": str(gp.optimizer),
+                "fit_n_restarts_optimizer": gp.n_restarts_optimizer,
+                "fit_random_state": gp.random_state,
+                "fit_yerr_scale": single_eval_noise["yerr_scale"] if is_single else mogp_eval_noise["yerr_scale"],
+                "fit_noise_floor": single_eval_noise["noise_floor"] if is_single else mogp_eval_noise["noise_floor"],
+                "fit_jitter": (single_gp_kwargs if is_single else mogp_gp_kwargs).get("jitter", 1e-8),
+                "time_length_scale": time_scale,
+                "kernel_amplitude": variance,
+                "training_row_ids": (np.asarray([f"{target_band}:{idx}" for idx in target_train_s["train_indices"]])
+                                     if is_single else data["row_id"].copy()),
+            })
+        if fraction_mode:
+            row.update({
+                "target_train_fraction": target_train_fraction,
+                "split_id": f"{example['object_id']}:{target_band}:{random_state}",
+                "evaluation_yerr_raw": target_heldout_rows["yerr_raw"].copy(),
+                "aux_train_fraction": aux_train_fraction,
+                "target_train_indices": target_split["train_indices"].copy(),
+                "target_pool_indices": _sampling_plan["target_split"]["train_indices"].copy(),
+                "aux_selected_indices_by_band": {
+                    str(band): indices.tolist()
+                    for band, indices in aux_selected_indices_by_band.items()
+                },
+            })
 
     if output_csv_path is not None:
         pd.DataFrame(rows).to_csv(output_csv_path, index=False)
@@ -1368,7 +1651,116 @@ def run_target_band_ablation_study(
         "models": tuple(model for model in DEFAULT_ABLATION_MODELS if model in models),
         "rows": rows,
         "artifacts": artifacts,
+        "failed_models": failed_models,
     }
+
+
+def run_target_band_sparsity_sweep(
+        examples, target_band="i", aux_train_fraction=0.5,
+        target_train_fractions=DEFAULT_TARGET_TRAIN_FRACTIONS,
+        random_states=(0,), output_dir=None, **ablation_kwargs):
+    """Run the existing ablations with one sampling plan per object and seed.
+
+    Defaults to the single/independent/real triplet with matched settings. Optional legacy ablation models can
+    be selected via models. Returns raw rows, skipped cases, and saved reports.
+    Fractions too small for two target points are recorded, never clamped.
+    examples accepts one object mapping (such as next(dataloader)) or an
+    iterable of object mappings (such as a list, generator, or dataset).
+    """
+    if isinstance(examples, Mapping):
+        examples = (examples,)
+    fractions = tuple(float(f) for f in target_train_fractions)
+    seeds = tuple(int(seed) for seed in random_states)
+    if not fractions or not seeds or len(set(fractions)) != len(fractions) or len(set(seeds)) != len(seeds):
+        raise ValueError("Provide nonempty, unique target fractions and random states.")
+    for fraction in fractions:
+        _validate_sampling_fractions(fraction, aux_train_fraction)
+    if ablation_kwargs.get("heldout_fraction", 0.2) != 0.2:
+        raise ValueError("Target sparsity requires heldout_fraction=0.2.")
+    ablation_kwargs.setdefault("models", THREE_MODEL_SPARSITY_MODELS)
+    ablation_kwargs.setdefault("standardize_model_settings", True)
+    ablation_kwargs.setdefault("continue_on_model_error", True)
+    if ablation_kwargs["standardize_model_settings"]:
+        single, mogp = _matched_sparsity_gp_kwargs(
+            ablation_kwargs.get("single_gp_kwargs"), ablation_kwargs.get("mogp_gp_kwargs"))
+        ablation_kwargs.update(single_gp_kwargs=single, mogp_gp_kwargs=mogp)
+    configured_models = ablation_kwargs["models"]
+    if configured_models is None:
+        configured_models = DEFAULT_ABLATION_MODELS
+    if isinstance(configured_models, str):
+        configured_models = (configured_models,)
+    unknown_models = set(configured_models) - set(DEFAULT_ABLATION_MODELS)
+    if unknown_models:
+        raise ValueError(f"Unknown ablation models: {sorted(unknown_models)}")
+    require_triplets = set(THREE_MODEL_SPARSITY_MODELS).issubset(configured_models)
+    if output_dir is not None:
+        from pathlib import Path
+        destination = Path(output_dir)
+        if destination.exists() and any(destination.glob("target_sparsity_*.csv")):
+            raise FileExistsError(f"Existing experiment results in {destination}; choose a new output_dir.")
+    bands = ablation_kwargs.get("bands", ("u", "g", "r", "i", "z", 0, 1, 2, 3, 4))
+    wavelengths = ablation_kwargs.get("band_to_wavelength") or DEFAULT_BAND_TO_WAVELENGTH
+    split_kwargs = {key: ablation_kwargs.get(key, default) for key, default in (
+        ("min_train_points", 5), ("min_heldout_points", 1), ("strategy", "random"),
+        ("force_peak_in_train", True), ("peak_mode", "absolute"))}
+    rows, skipped, incomplete = [], [], []
+    for example in examples:
+        if not isinstance(example, Mapping):
+            raise TypeError(
+                "examples must be an object mapping or an iterable of object mappings; "
+                f"received an item of type {type(example).__name__}."
+            )
+        for seed in seeds:
+            try:
+                plan = _make_target_sparsity_plan(
+                    example, target_band, bands, wavelengths, aux_train_fraction,
+                    seed, **split_kwargs)
+            except ValueError as exc:
+                skipped.append(dict(object_id=example["object_id"], **{"class": example["obj_type"]},
+                                    target_band=target_band, random_state=seed,
+                                    aux_train_fraction=aux_train_fraction,
+                                    target_train_fraction=None, reason=str(exc)))
+                continue
+            for fraction in fractions:
+                try:
+                    result = run_target_band_ablation_study(
+                        example, target_band=target_band, random_state=seed,
+                        target_train_fraction=fraction, aux_train_fraction=aux_train_fraction,
+                        _sampling_plan=plan, **ablation_kwargs)
+                except ValueError as exc:
+                    skipped.append(dict(object_id=example["object_id"], **{"class": example["obj_type"]},
+                                        target_band=target_band, random_state=seed,
+                                        aux_train_fraction=aux_train_fraction,
+                                        target_train_fraction=fraction, reason=str(exc)))
+                    continue
+                rows.extend(result["rows"])
+                if result["failed_models"]:
+                    incomplete.append({
+                        "object_id": example["object_id"], "class": example["obj_type"],
+                        "target_band": target_band, "random_state": seed,
+                        "split_id": f"{example['object_id']}:{target_band}:{seed}",
+                        "target_train_fraction": fraction, "aux_train_fraction": aux_train_fraction,
+                        "missing_models": [failure["model"] for failure in result["failed_models"]],
+                        "present_models": [row["model"] for row in result["rows"]],
+                        "reasons": result["failed_models"],
+                    })
+    skipped_columns = ["object_id", "class", "target_band", "random_state",
+                       "aux_train_fraction", "target_train_fraction", "reason"]
+    result = {"rows": rows, "skipped": pd.DataFrame(skipped, columns=skipped_columns),
+              "incomplete_triplets": pd.DataFrame(incomplete, columns=[
+                  "object_id", "class", "target_band", "random_state", "split_id",
+                  "target_train_fraction", "aux_train_fraction", "missing_models", "present_models", "reasons"])}
+    if output_dir is not None:
+        from pathlib import Path
+        from evaluation_metrics import save_target_sparsity_reports
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        result["skipped"].to_csv(Path(output_dir) / "target_sparsity_skipped.csv", index=False)
+        if rows:
+            result["reports"] = save_target_sparsity_reports(
+                pd.DataFrame(rows), output_dir, require_triplets=require_triplets)
+        result["incomplete_triplets"].to_csv(
+            Path(output_dir) / "target_sparsity_fit_failures.csv", index=False)
+    return result
 
 
 def _debug_object_summary(train_data, heldout_data, gp=None):
@@ -1443,7 +1835,6 @@ def run_mogp_evaluation(
         "time_length_scale",
         "wavelength_length_scale",
         "time_length_scale_bounds",
-        "wavelength_length_scale_bounds",
         "constant_value",
         "constant_value_bounds",
         "yerr_scale",

@@ -1,0 +1,125 @@
+object_id,source_experiment,experiment_aux_band,seed,target_train_fraction,prediction_extremum,nearby_trained_aux_peak_bands,n_target_observations_near,n_target_train_near,target_region_status,near_days
+6460481,part2,g,2,0.2,maximum,g,1,0,observed within window,5.0
+6460481,part2,g,2,0.2,minimum,—,1,1,observed within window,5.0
+6460481,part2,g,2,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+6460481,part2,g,2,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+34161124,part1,all,0,0.2,maximum,z,1,0,observed within window,5.0
+34161124,part1,all,0,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+34161124,part1,all,0,0.8,maximum,z,1,0,observed within window,5.0
+34161124,part1,all,0,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+34161124,part2,z,0,0.2,maximum,z,1,0,observed within window,5.0
+34161124,part2,z,0,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+34161124,part2,z,0,0.8,maximum,z,1,0,observed within window,5.0
+34161124,part2,z,0,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+34866353,part1,all,1,0.2,maximum,r,2,0,observed within window,5.0
+34866353,part1,all,1,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+34866353,part1,all,1,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+34866353,part1,all,1,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+126309844,part1,all,2,0.2,maximum,r,0,0,observationally unconstrained within window,5.0
+126309844,part1,all,2,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+126309844,part1,all,2,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+126309844,part1,all,2,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+4413277,part1,all,1,0.2,maximum,—,0,0,observationally unconstrained within window,5.0
+4413277,part1,all,1,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+4413277,part1,all,1,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+4413277,part1,all,1,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+9858227,part1,all,1,0.2,maximum,z,0,0,observationally unconstrained within window,5.0
+9858227,part1,all,1,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+9858227,part1,all,1,0.8,maximum,z,0,0,observationally unconstrained within window,5.0
+9858227,part1,all,1,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+3100669,part1,all,0,0.2,maximum,r,0,0,observationally unconstrained within window,5.0
+3100669,part1,all,0,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+3100669,part1,all,0,0.8,maximum,r,0,0,observationally unconstrained within window,5.0
+3100669,part1,all,0,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+85439795,part1,all,2,0.2,maximum,u,1,0,observed within window,5.0
+85439795,part1,all,2,0.2,minimum,r,1,0,observed within window,5.0
+85439795,part1,all,2,0.8,maximum,—,1,1,observed within window,5.0
+85439795,part1,all,2,0.8,minimum,r,0,0,observationally unconstrained within window,5.0
+130739978,part1,all,1,0.2,maximum,g,1,0,observed within window,5.0
+130739978,part1,all,1,0.2,minimum,—,2,0,observed within window,5.0
+130739978,part1,all,1,0.8,maximum,g,1,0,observed within window,5.0
+130739978,part1,all,1,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+34866353,part1,all,0,0.2,maximum,—,0,0,observationally unconstrained within window,5.0
+34866353,part1,all,0,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+34866353,part1,all,0,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+34866353,part1,all,0,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+44307163,part1,all,1,0.2,maximum,z,0,0,observationally unconstrained within window,5.0
+44307163,part1,all,1,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+44307163,part1,all,1,0.8,maximum,z,0,0,observationally unconstrained within window,5.0
+44307163,part1,all,1,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+44307163,part1,all,0,0.2,maximum,—,1,0,observed within window,5.0
+44307163,part1,all,0,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+44307163,part1,all,0,0.8,maximum,—,1,0,observed within window,5.0
+44307163,part1,all,0,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+34866353,part1,all,2,0.2,maximum,r,2,1,observed within window,5.0
+34866353,part1,all,2,0.2,minimum,r,1,0,observed within window,5.0
+34866353,part1,all,2,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+34866353,part1,all,2,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+44307163,part1,all,2,0.2,maximum,—,1,0,observed within window,5.0
+44307163,part1,all,2,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+44307163,part1,all,2,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+44307163,part1,all,2,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+36842485,part1,all,2,0.2,maximum,r,0,0,observationally unconstrained within window,5.0
+36842485,part1,all,2,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+36842485,part1,all,2,0.8,maximum,r,0,0,observationally unconstrained within window,5.0
+36842485,part1,all,2,0.8,minimum,—,1,1,observed within window,5.0
+34866353,part2,r,1,0.2,maximum,r,2,0,observed within window,5.0
+34866353,part2,r,1,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+34866353,part2,r,1,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+34866353,part2,r,1,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+44307163,part2,z,0,0.2,maximum,—,0,0,observationally unconstrained within window,5.0
+44307163,part2,z,0,0.2,minimum,—,1,0,observed within window,5.0
+44307163,part2,z,0,0.8,maximum,—,1,1,observed within window,5.0
+44307163,part2,z,0,0.8,minimum,—,1,0,observed within window,5.0
+9858227,part2,z,1,0.2,maximum,z,0,0,observationally unconstrained within window,5.0
+9858227,part2,z,1,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+9858227,part2,z,1,0.8,maximum,z,0,0,observationally unconstrained within window,5.0
+9858227,part2,z,1,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+67410269,part2,g,0,0.2,maximum,—,0,0,observationally unconstrained within window,5.0
+67410269,part2,g,0,0.2,minimum,—,1,1,observed within window,5.0
+67410269,part2,g,0,0.8,maximum,—,1,1,observed within window,5.0
+67410269,part2,g,0,0.8,minimum,—,1,1,observed within window,5.0
+3100669,part2,r,0,0.2,maximum,r,0,0,observationally unconstrained within window,5.0
+3100669,part2,r,0,0.2,minimum,—,1,0,observed within window,5.0
+3100669,part2,r,0,0.8,maximum,r,0,0,observationally unconstrained within window,5.0
+3100669,part2,r,0,0.8,minimum,—,1,0,observed within window,5.0
+59907038,part2,g,2,0.2,maximum,—,0,0,observationally unconstrained within window,5.0
+59907038,part2,g,2,0.2,minimum,—,1,0,observed within window,5.0
+59907038,part2,g,2,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+59907038,part2,g,2,0.8,minimum,—,1,1,observed within window,5.0
+127779559,part2,r,0,0.2,maximum,r,0,0,observationally unconstrained within window,5.0
+127779559,part2,r,0,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+127779559,part2,r,0,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+127779559,part2,r,0,0.8,minimum,—,2,1,observed within window,5.0
+34866353,part2,r,0,0.2,maximum,—,0,0,observationally unconstrained within window,5.0
+34866353,part2,r,0,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+34866353,part2,r,0,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+34866353,part2,r,0,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+44307163,part2,z,1,0.2,maximum,—,1,1,observed within window,5.0
+44307163,part2,z,1,0.2,minimum,—,1,0,observed within window,5.0
+44307163,part2,z,1,0.8,maximum,z,0,0,observationally unconstrained within window,5.0
+44307163,part2,z,1,0.8,minimum,—,1,1,observed within window,5.0
+44307163,part2,r,1,0.2,maximum,r,0,0,observationally unconstrained within window,5.0
+44307163,part2,r,1,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+44307163,part2,r,1,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+44307163,part2,r,1,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+100122518,part2,r,0,0.2,maximum,—,1,0,observed within window,5.0
+100122518,part2,r,0,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+100122518,part2,r,0,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+100122518,part2,r,0,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+44307163,part2,r,2,0.2,maximum,—,0,0,observationally unconstrained within window,5.0
+44307163,part2,r,2,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+44307163,part2,r,2,0.8,maximum,—,0,0,observationally unconstrained within window,5.0
+44307163,part2,r,2,0.8,minimum,—,1,0,observed within window,5.0
+34866353,part2,r,2,0.2,maximum,r,2,1,observed within window,5.0
+34866353,part2,r,2,0.2,minimum,r,1,0,observed within window,5.0
+34866353,part2,r,2,0.8,maximum,r,0,0,observationally unconstrained within window,5.0
+34866353,part2,r,2,0.8,minimum,—,0,0,observationally unconstrained within window,5.0
+130739978,part2,g,1,0.2,maximum,g,1,0,observed within window,5.0
+130739978,part2,g,1,0.2,minimum,—,1,0,observed within window,5.0
+130739978,part2,g,1,0.8,maximum,g,1,0,observed within window,5.0
+130739978,part2,g,1,0.8,minimum,—,2,1,observed within window,5.0
+115557873,part2,r,2,0.2,maximum,—,0,0,observationally unconstrained within window,5.0
+115557873,part2,r,2,0.2,minimum,—,0,0,observationally unconstrained within window,5.0
+115557873,part2,r,2,0.8,maximum,—,1,1,observed within window,5.0
+115557873,part2,r,2,0.8,minimum,—,0,0,observationally unconstrained within window,5.0

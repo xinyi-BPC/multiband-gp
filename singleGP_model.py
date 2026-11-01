@@ -171,7 +171,13 @@ def object_level_empirical_flux_scale(
         valid = np.isfinite(flux)
         if "time" in lc:
             time = np.asarray(lc["time"], dtype=float)
-            valid &= np.isfinite(time)
+            if "time" in lc:
+                time = np.asarray(lc["time"], dtype=float)
+                valid &= np.isfinite(time) & (time > 0)
+
+            if "flux_err" in lc:
+                flux_err = np.asarray(lc["flux_err"], dtype=float)
+                valid &= np.isfinite(flux_err)
         if band_filter is not None and "band" in lc:
             band = np.asarray(lc["band"], dtype=object)
             valid &= np.asarray([str(value) in band_filter for value in band])
